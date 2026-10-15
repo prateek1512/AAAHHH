@@ -1,0 +1,13 @@
+{
+  "0": "test_document_upload.py",
+  "1": "test_ocr.py",
+  "2": "landowner_app.py",
+  "3": "database.py",
+  "4": "auth.py",
+  "5": ".require_role",
+  "6": "AuthService",
+  "7": "Database",
+  "8": "AI-Powered Land Record Management and Verification System",
+  "9": "__init__.py",
+  "10": "land-record-management"
+}

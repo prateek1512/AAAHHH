@@ -1,0 +1,26 @@
+[project]
+name = "land-record-management"
+version = "0.1.0"
+description = "AI-powered land record management and verification prototype"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "argon2-cffi>=25.1.0",
+    "numpy>=2.5.4",
+    "opencv-python-headless>=5.0.0.93",
+    "pandas>=3.0.6",
+    "pillow>=12.3.0",
+    "pydantic>=2.14.1",
+    "pymupdf>=1.28.2",
+    "pytesseract>=0.3.13",
+    "sqlalchemy>=2.1.4",
+    "streamlit>=1.66.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
