@@ -126,8 +126,31 @@ officer or available under `LAND_RECORDS_REVIEW_POLICY`. Officers can filter the
 queue by status, application number, district, and village; open private
 application details and original documents; and claim an unassigned application
 to begin review. Claiming changes a submitted application to `under_review` and
-adds an audit event. This review view does not provide approval, rejection, or
-correction-decision actions.
+adds an audit event.
+
+An assigned officer can approve, reject, or request corrections from the
+application review page after explicitly confirming the action. Rejection and
+correction requests require a meaningful explanation. Approval requires valid
+owner-reviewed fields and an attached supporting document; OCR confidence is
+never an approval criterion. Each decision transaction updates application
+status, adds review history, creates a hash-linked audit event, and notifies the
+landowner. Approval additionally snapshots the approved fields into a
+`LandRecord` with a record reference and SHA-256 hash. Rejected applications
+remain preserved and do not enter the approved registry. The officer assigned
+to a completed application may reopen its read-only details and history, but
+cannot make another decision.
+
+When corrections are requested, the landowner can open the application under
+**My Applications**, review the officer's instructions and decision history,
+save revised fields as a new version, and append private supporting documents
+without replacing the original upload. Resubmission is an explicit confirmed
+action. It creates another immutable version snapshot, returns the application
+to `submitted`, appends an `application_resubmitted` audit event, and creates
+in-app notifications for the landowner and assigned officer (or active officers
+when unassigned). Landowners can mark their own notifications as read; the
+notification history is retained. Final approval or rejection and its review
+history remain visible in the landowner application details. Approved records
+cannot be edited through this correction workflow.
 
 ## Run tests
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from io import BytesIO
 import re
+from uuid import uuid4
 
 import pytest
 from PIL import Image
@@ -196,6 +197,208 @@ def test_complete_upload_ocr_edit_submit_workflow(
                 Notification.user_id == owner.id,
             )
         ) == 1
+
+
+def test_correction_resubmission_preserves_versions_and_notifies_reviewers(
+    submission_context: tuple[sessionmaker[Session], AuthService, str, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_factory, service, owner_token, _, officer_token = submission_context
+    _install_controlled_ocr(monkeypatch)
+    application_id = _upload_and_edit(service, owner_token)
+    initial_submission = service.submit_landowner_application(owner_token, application_id)
+
+    service.start_officer_application_review(officer_token, application_id)
+    service.decide_officer_application(
+        officer_token,
+        application_id,
+        "request_corrections",
+        "Please correct the survey number against the attached instrument.",
+    )
+
+    correction_detail = service.get_landowner_application(owner_token, application_id)
+    assert correction_detail.status == "corrections_requested"
+    correction_event = correction_detail.review_events[-1]
+    assert correction_event.decision == "request_corrections"
+    assert "correct the survey number" in (correction_event.comments or "")
+    assert correction_event.officer_name == "Synthetic Officer"
+
+    revised_fields = _valid_fields()
+    revised_fields["survey_or_plot_number"] = "SY-456"
+    original_document = next(
+        document
+        for document in service.list_landowner_documents(owner_token)
+        if document.application_id == application_id
+    )
+    added_document = service.upload_landowner_supporting_document(
+        owner_token,
+        application_id,
+        "supporting-evidence.png",
+        "image/png",
+        _png_bytes(),
+    )
+    assert added_document.application_id == application_id
+    assert added_document.original_filename == "supporting-evidence.png"
+
+    resubmission = service.resubmit_landowner_application(
+        owner_token,
+        application_id,
+        revised_fields,
+    )
+    assert resubmission.status == "submitted"
+    assert resubmission.current_version == initial_submission.current_version + 2
+    assert resubmission.corrected_fields_json["survey_or_plot_number"] == "SY-456"
+
+    with session_factory() as session:
+        application = session.get(Application, application_id)
+        assert application is not None
+        assert application.status == "submitted"
+        assert application.current_version == resubmission.current_version
+        old_submission = session.scalar(
+            select(ApplicationVersion).where(
+                ApplicationVersion.application_id == application_id,
+                ApplicationVersion.version_number == initial_submission.current_version,
+            )
+        )
+        assert old_submission is not None
+        assert old_submission.corrected_fields_json["survey_or_plot_number"] == "SY-123"
+        revised_version = session.scalar(
+            select(ApplicationVersion).where(
+                ApplicationVersion.application_id == application_id,
+                ApplicationVersion.version_number == initial_submission.current_version + 1,
+            )
+        )
+        assert revised_version is not None
+        assert revised_version.corrected_fields_json["survey_or_plot_number"] == "SY-456"
+        current_snapshot = session.scalar(
+            select(ApplicationVersion).where(
+                ApplicationVersion.application_id == application_id,
+                ApplicationVersion.version_number == resubmission.current_version,
+            )
+        )
+        assert current_snapshot is not None
+        assert current_snapshot.corrected_fields_json == revised_fields
+        assert session.scalar(
+            select(func.count()).select_from(AuditEvent).where(
+                AuditEvent.application_id == application_id,
+                AuditEvent.event_type == "application_resubmitted",
+            )
+        ) == 1
+        officer = session.scalar(select(User).where(User.email == "officer@example.test"))
+        owner = session.scalar(select(User).where(User.email == "owner@example.test"))
+        assert officer is not None and owner is not None
+        assert session.scalar(
+            select(func.count()).select_from(Notification).where(
+                Notification.application_id == application_id,
+                Notification.user_id == officer.id,
+                Notification.title == "Application ready for review",
+            )
+        ) == 1
+        assert session.scalar(
+            select(func.count()).select_from(Notification).where(
+                Notification.application_id == application_id,
+                Notification.user_id == owner.id,
+                Notification.title == "Application resubmitted",
+            )
+        ) == 1
+
+    assert len(
+        [
+            item
+            for item in service.list_landowner_documents(owner_token)
+            if item.application_id == application_id
+        ]
+    ) == 2
+    audit_events = service.list_audit_events(officer_token, application_id=application_id)
+    assert any(
+        item.event_type == "application_resubmitted" and item.integrity_verified
+        for item in audit_events
+    )
+    with pytest.raises(ValueError, match="not awaiting corrections"):
+        service.resubmit_landowner_application(owner_token, application_id)
+    with session_factory() as session:
+        assert session.scalar(
+            select(func.count()).select_from(AuditEvent).where(
+                AuditEvent.application_id == application_id,
+                AuditEvent.event_type == "application_resubmitted",
+            )
+        ) == 1
+
+    service.start_officer_application_review(officer_token, application_id)
+    approval = service.decide_officer_application(officer_token, application_id, "approve")
+    approved_detail = service.get_landowner_application(owner_token, application_id)
+    assert approval.status == "approved"
+    assert approved_detail.status == "approved"
+    assert approved_detail.public_record_id == approval.public_record_id
+    assert approved_detail.review_events[-1].decision == "approve"
+    with pytest.raises(AuthorizationError, match="already been approved"):
+        service.save_landowner_document_corrections(
+            owner_token,
+            original_document.id,
+            revised_fields,
+        )
+
+
+def test_landowner_notification_read_is_persistent_and_owner_scoped(
+    submission_context: tuple[sessionmaker[Session], AuthService, str, str, str],
+) -> None:
+    session_factory, service, owner_token, other_owner_token, officer_token = submission_context
+    application_id = _application_for_notification_test(session_factory)
+    with transaction(session_factory) as session:
+        owner = session.scalar(select(User).where(User.email == "owner@example.test"))
+        other_owner = session.scalar(
+            select(User).where(User.email == "other-owner@example.test")
+        )
+        assert owner is not None and other_owner is not None
+        owner_notification = Notification(
+            user_id=owner.id,
+            application_id=application_id,
+            title="Unread update",
+            message="Your application needs attention.",
+        )
+        other_notification = Notification(
+            user_id=other_owner.id,
+            application_id=application_id,
+            title="Private update",
+            message="This notification belongs to another owner.",
+        )
+        session.add_all([owner_notification, other_notification])
+        session.flush()
+        owner_notification_id = owner_notification.id
+        other_notification_id = other_notification.id
+
+    owner_notifications = service.list_landowner_notifications(owner_token)
+    assert [item.id for item in owner_notifications] == [owner_notification_id]
+    assert owner_notifications[0].is_read is False
+    service.mark_landowner_notification_read(owner_token, owner_notification_id)
+    assert service.list_landowner_notifications(owner_token)[0].is_read is True
+    with pytest.raises(AuthorizationError):
+        service.mark_landowner_notification_read(owner_token, other_notification_id)
+    with pytest.raises(AuthorizationError):
+        service.mark_landowner_notification_read(officer_token, owner_notification_id)
+    assert [item.id for item in service.list_landowner_notifications(other_owner_token)] == [
+        other_notification_id
+    ]
+    with session_factory() as session:
+        persisted_notification = session.get(Notification, owner_notification_id)
+        assert persisted_notification is not None
+        assert persisted_notification.is_read is True
+
+
+def _application_for_notification_test(
+    session_factory: sessionmaker[Session],
+) -> int:
+    with transaction(session_factory) as session:
+        owner = session.scalar(select(User).where(User.email == "owner@example.test"))
+        assert owner is not None
+        application = Application(
+            application_number=f"LR-NOTIFY-{uuid4().hex[:10]}",
+            applicant_id=owner.id,
+            status="submitted",
+        )
+        session.add(application)
+        session.flush()
+        return application.id
 
 
 def test_invalid_submission_does_not_change_status_or_emit_success_events(

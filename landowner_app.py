@@ -14,7 +14,7 @@ from modules.auth import (
 )
 from modules.auth_ui import get_auth_service, render_login
 from modules.document_storage import DocumentStorageError
-from modules.field_validation import REQUIRED_FIELDS, validate_corrected_fields
+from modules.field_validation import FIELD_LABELS, REQUIRED_FIELDS, validate_corrected_fields
 from modules.ocr import render_document_preview
 
 st.set_page_config(
@@ -125,14 +125,34 @@ def _render_notifications(notifications: tuple[NotificationSummary, ...]) -> Non
     if not notifications:
         st.info("You don't have any notifications yet.")
         return
+    unread_count = sum(not notification.is_read for notification in notifications)
+    st.metric("Unread notifications", unread_count)
     for notification in notifications:
         with st.container(border=True):
+            if not notification.is_read:
+                st.markdown("**UNREAD**")
             st.markdown(f"**{notification.title}**")
             st.write(notification.message)
             st.caption(
                 f"{notification.created_at.strftime('%d %b %Y, %H:%M UTC')} · "
                 f"{'Read' if notification.is_read else 'Unread'}"
             )
+            if not notification.is_read and st.button(
+                "Mark as read",
+                key=f"mark_notification_read_{notification.id}",
+            ):
+                try:
+                    service.mark_landowner_notification_read(token, notification.id)
+                except AuthorizationError as error:
+                    st.error(str(error))
+                except SQLAlchemyError:
+                    logger.exception(
+                        "Database error marking landowner notification %s read",
+                        notification.id,
+                    )
+                    st.error("The notification could not be marked as read.")
+                else:
+                    st.rerun()
 
 
 def _render_metrics(metrics: LandownerDashboardMetrics) -> None:
@@ -528,6 +548,9 @@ def _my_applications() -> None:
         st.error(str(error))
         return
     st.subheader(f"Application {detail.application_number}")
+    resubmission_notice_key = f"resubmitted_notice_{detail.id}"
+    if resubmission_notice_key in st.session_state:
+        st.success(st.session_state.pop(resubmission_notice_key))
     st.write(f"**Current status:** {_status_label(detail.status)}")
     st.write(f"**Current version:** {detail.current_version}")
     st.write(
@@ -546,14 +569,197 @@ def _my_applications() -> None:
     for field_name, value in detail.corrected_fields_json.items():
         label = field_name.replace("_", " ").title()
         st.write(f"**{label}:** {value if isinstance(value, str) and value else 'Not provided'}")
-    if detail.status == "submitted":
+    if detail.status in ("submitted", "under_review"):
         _show_pending_notice()
+
+    if detail.status == "corrections_requested":
+        correction_event = next(
+            (
+                event
+                for event in reversed(detail.review_events)
+                if event.decision == "request_corrections"
+            ),
+            None,
+        )
+        st.subheader("Changes requested by the reviewing officer")
+        if correction_event is not None:
+            st.warning(correction_event.comments or "Please review the requested corrections.")
+            st.caption(
+                f"Requested by {correction_event.officer_name} · "
+                f"{correction_event.created_at.strftime('%d %b %Y, %H:%M UTC')}"
+            )
+
+        st.subheader("Revise your application")
+        st.caption(
+            "Changes are saved as a new version. Earlier submitted versions and the "
+            "original documents remain unchanged."
+        )
+        correction_form_key = f"landowner_corrections_{detail.id}"
+        with st.form(correction_form_key):
+            revised_fields: dict[str, str] = {}
+            for field_name, label in FIELD_LABELS.items():
+                value = detail.corrected_fields_json.get(field_name)
+                revised_fields[field_name] = st.text_input(
+                    label,
+                    value=value if isinstance(value, str) else "",
+                    key=f"resubmit_field_{detail.id}_{field_name}",
+                    help=(
+                        "Enter a positive area and explicit unit; ambiguous units are not converted."
+                        if field_name == "land_area"
+                        else "Optional field. Leave blank if it is not in the document."
+                        if field_name not in REQUIRED_FIELDS
+                        else "Required field."
+                    ),
+                )
+            confirm_resubmission = st.checkbox(
+                f"I confirm that application {detail.application_number} is ready for review again."
+            )
+            save_revisions = st.form_submit_button(
+                "Save revised fields",
+                disabled=not detail.document_ids,
+            )
+            resubmit = st.form_submit_button(
+                "Save changes and resubmit for review",
+                type="primary",
+                disabled=not detail.document_ids,
+            )
+        if save_revisions:
+            field_errors = validate_corrected_fields(revised_fields)
+            if field_errors:
+                st.error("Correct these fields before saving:")
+                for field_error in field_errors:
+                    st.warning(field_error)
+            elif not detail.document_ids:
+                st.error("A supporting document is unavailable, so corrections cannot be saved.")
+            else:
+                try:
+                    service.save_landowner_document_corrections(
+                        token,
+                        detail.document_ids[0],
+                        revised_fields,
+                    )
+                except (AuthorizationError, ValueError) as error:
+                    st.error(str(error))
+                except SQLAlchemyError:
+                    logger.exception(
+                        "Database error saving corrections for application %s",
+                        detail.id,
+                    )
+                    st.error("Your revised fields could not be saved.")
+                else:
+                    st.success("Revised fields saved as a new application version.")
+                    st.rerun()
+        elif resubmit:
+            field_errors = validate_corrected_fields(revised_fields)
+            if not confirm_resubmission:
+                st.error("Confirm that the application is ready before resubmitting.")
+            elif field_errors:
+                st.error("Correct these fields before resubmitting:")
+                for field_error in field_errors:
+                    st.warning(field_error)
+            else:
+                try:
+                    submission = service.resubmit_landowner_application(
+                        token,
+                        detail.id,
+                        revised_fields,
+                    )
+                except (AuthorizationError, ValueError) as error:
+                    st.error(str(error))
+                except SQLAlchemyError:
+                    logger.exception(
+                        "Database error resubmitting application %s",
+                        detail.id,
+                    )
+                    st.error(
+                        "The application could not be resubmitted. No successful "
+                        "resubmission was confirmed."
+                    )
+                else:
+                    st.session_state[resubmission_notice_key] = (
+                        f"Application **{submission.application_number}** was resubmitted "
+                        f"as version {submission.current_version} and is ready for review."
+                    )
+                    st.rerun()
+
+        st.subheader("Upload supporting documents")
+        with st.form(f"correction_document_{detail.id}"):
+            supporting_file = st.file_uploader(
+                "Choose an additional document",
+                type=["pdf", "png", "jpg", "jpeg"],
+                max_upload_size=service.max_upload_size_mb,
+                key=f"correction_upload_{detail.id}",
+            )
+            upload_supporting = st.form_submit_button("Upload supporting document")
+        if upload_supporting:
+            if supporting_file is None:
+                st.error("Choose a document before uploading.")
+            else:
+                try:
+                    added_document = service.upload_landowner_supporting_document(
+                        token,
+                        detail.id,
+                        supporting_file.name,
+                        supporting_file.type or "",
+                        supporting_file.getvalue(),
+                    )
+                except (AuthorizationError, DocumentStorageError) as error:
+                    st.error(str(error))
+                except SQLAlchemyError:
+                    logger.exception(
+                        "Database error adding a supporting document to application %s",
+                        detail.id,
+                    )
+                    st.error("The supporting document could not be saved.")
+                else:
+                    st.success(f"Added **{added_document.original_filename}**.")
+                    st.rerun()
+
+    if detail.status in ("approved", "rejected"):
+        if detail.status == "approved":
+            st.success(
+                "Final decision: approved."
+                + (
+                    f" Official record reference: {detail.public_record_id}."
+                    if detail.public_record_id
+                    else ""
+                )
+            )
+        else:
+            rejection = next(
+                (
+                    event
+                    for event in reversed(detail.review_events)
+                    if event.decision == "reject"
+                ),
+                None,
+            )
+            st.error(
+                "Final decision: rejected."
+                + (f" Reason: {rejection.comments}" if rejection and rejection.comments else "")
+            )
+
+    st.subheader("Review history")
+    if not detail.review_events:
+        st.info("No officer review decisions have been recorded.")
+    else:
+        for event in detail.review_events:
+            decision_label = {
+                "request_corrections": "Corrections requested",
+                "approve": "Approved",
+                "reject": "Rejected",
+            }.get(event.decision, event.decision.replace("_", " ").title())
+            st.markdown(f"**{decision_label}** · {event.officer_name}")
+            if event.comments:
+                st.write(event.comments)
+            st.caption(event.created_at.strftime("%d %b %Y, %H:%M UTC"))
 
 
 def _notifications() -> None:
     st.markdown('<div class="portal-eyebrow">Updates</div>', unsafe_allow_html=True)
     st.title("Notifications")
-    _render_notifications(service.list_landowner_notifications(token))
+    notifications = service.list_landowner_notifications(token)
+    _render_notifications(notifications)
 
 
 def _approved_records() -> None:

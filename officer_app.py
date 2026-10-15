@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import logging
 
+import logging
+
 import streamlit as st
+from sqlalchemy.exc import SQLAlchemyError
 
 from modules.auth import (
     ApplicationReviewDetail,
@@ -241,8 +244,8 @@ def _application_review() -> None:
     st.markdown('<div class="portal-eyebrow">Application review</div>', unsafe_allow_html=True)
     st.title("Application Review")
     st.caption(
-        "Review the submitted application and supporting evidence. Final approval, "
-        "rejection, and correction decisions are not available here."
+        "Review the submitted application and supporting evidence. Decisions are "
+        "recorded in the review history and audit log."
     )
 
     app_id = st.session_state.get("selected_review_application_id")
@@ -261,6 +264,9 @@ def _application_review() -> None:
     if detail is None:
         st.error("Application not found or you are not authorized to review it.")
         return
+    decision_notice_key = f"decision_notice_{detail.id}"
+    if decision_notice_key in st.session_state:
+        st.success(st.session_state.pop(decision_notice_key))
 
     # Header
     col1, col2 = st.columns([3, 1])
@@ -274,6 +280,7 @@ def _application_review() -> None:
         f"Version {detail.current_version} · Submitted "
         f"{detail.submitted_at.strftime('%d %b %Y, %H:%M UTC') if detail.submitted_at else 'date unavailable'}"
     )
+    officer = service.require_role(token, "officer")
     if detail.assigned_officer_id is None:
         if detail.status in {"submitted", "under_review", "corrections_requested"}:
             if st.button("Assign to me and start review", type="primary"):
@@ -289,10 +296,24 @@ def _application_review() -> None:
     else:
         st.info(
             "This application is assigned to you."
-            if detail.assigned_officer_id
-            == service.require_role(token, "officer").user_id
+            if detail.assigned_officer_id == officer.user_id
             else "This application is assigned to an officer."
         )
+        if (
+            detail.assigned_officer_id == officer.user_id
+            and detail.status == "submitted"
+            and st.button("Start review", type="primary")
+        ):
+            try:
+                review_started = service.start_officer_application_review(
+                    token,
+                    detail.id,
+                )
+            except (AuthorizationError, ValueError) as error:
+                st.error(str(error))
+            else:
+                st.success(f"Current status: {_status_label(review_started.status)}.")
+                st.rerun()
 
     st.divider()
 
@@ -402,10 +423,79 @@ def _application_review() -> None:
             st.info("No review events yet.")
 
     st.divider()
-    st.warning(
-        "Review decision workflows (approve, reject, request corrections) are not implemented in this prototype. "
-        "This view is read-only."
-    )
+    if detail.status != "under_review":
+        st.info("A decision is available only while the application is under review.")
+    elif detail.assigned_officer_id != officer.user_id:
+        st.info("Assign the application to yourself before making a decision.")
+    else:
+        st.subheader("Record a review decision")
+        st.caption(
+            "Decisions are final for this application state. Approval depends on validated "
+            "owner-reviewed fields and a supporting document, never OCR confidence alone."
+        )
+        with st.form(f"decision_form_{detail.id}"):
+            decision_label = st.selectbox(
+                "Decision",
+                ("Approve", "Reject", "Request corrections"),
+                key=f"decision_choice_{detail.id}",
+            )
+            decision = {
+                "Approve": "approve",
+                "Reject": "reject",
+                "Request corrections": "request_corrections",
+            }[decision_label]
+            comments = st.text_area(
+                "Reason or correction instructions",
+                help=(
+                    "Required for rejection and correction requests. Explain the basis "
+                    "for the rejection or the specific changes needed."
+                ),
+                key=f"decision_comments_{detail.id}",
+            )
+            confirmed = st.checkbox(
+                f"I confirm this {decision_label.lower()} decision for "
+                f"{detail.application_number}.",
+                key=f"decision_confirm_{detail.id}",
+            )
+            submit_decision = st.form_submit_button(
+                "Confirm and save decision",
+                type="primary",
+            )
+        if submit_decision:
+            if not confirmed:
+                st.error("Confirm the decision before saving it.")
+            elif decision in {"reject", "request_corrections"} and len(comments.strip()) < 10:
+                st.error(
+                    "Enter a meaningful reason or correction message of at least 10 characters."
+                )
+            else:
+                try:
+                    result = service.decide_officer_application(
+                        token,
+                        detail.id,
+                        decision,
+                        comments,
+                    )
+                except (AuthorizationError, ValueError) as error:
+                    st.error(str(error))
+                except SQLAlchemyError:
+                    logger.exception(
+                        "Database transaction failed for decision on application %s",
+                        detail.id,
+                    )
+                    st.error(
+                        "The decision could not be saved because the database transaction "
+                        "failed. No decision was confirmed."
+                    )
+                else:
+                    decision_message = (
+                        f"{result.application_number} was "
+                        f"{'approved' if result.status == 'approved' else result.status.replace('_', ' ')}."
+                    )
+                    if result.public_record_id:
+                        decision_message += f" Public record ID: {result.public_record_id}."
+                    st.session_state[decision_notice_key] = decision_message
+                    st.rerun()
 
 
 def _approved_registry() -> None:

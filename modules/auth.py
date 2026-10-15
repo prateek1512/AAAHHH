@@ -16,6 +16,7 @@ from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatc
 
 from modules.database import (
     ApplicationData,
+    ApplicationDecisionData,
     ApplicationSubmissionData,
     AuthUserData,
     Database,
@@ -94,6 +95,18 @@ class LandownerApplicationDetail:
     current_version: int
     corrected_fields_json: dict[str, object]
     document_filenames: tuple[str, ...]
+    document_ids: tuple[int, ...]
+    review_events: tuple[LandownerReviewEvent, ...]
+    public_record_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class LandownerReviewEvent:
+    id: int
+    decision: str
+    comments: str | None
+    created_at: datetime
+    officer_name: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,6 +248,16 @@ class OfficerReviewStarted:
 
 
 @dataclass(frozen=True, slots=True)
+class ApplicationDecision:
+    application_id: int
+    application_number: str
+    decision: str
+    status: str
+    decided_at: datetime
+    public_record_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class ApprovedRegistryRecord:
     public_record_id: str
     application_number: str
@@ -329,6 +352,22 @@ def _landowner_application_detail(
         current_version=application.current_version,
         corrected_fields_json=application.corrected_fields_json,
         document_filenames=application.document_filenames,
+        document_ids=application.document_ids,
+        review_events=tuple(
+            LandownerReviewEvent(
+                id=event.id,
+                decision=event.decision,
+                comments=event.comments,
+                created_at=(
+                    event.created_at.replace(tzinfo=UTC)
+                    if event.created_at.tzinfo is None
+                    else event.created_at.astimezone(UTC)
+                ),
+                officer_name=event.officer_name,
+            )
+            for event in application.review_events
+        ),
+        public_record_id=application.public_record_id,
     )
 
 
@@ -352,7 +391,11 @@ def _notification_summary(notification: NotificationData) -> NotificationSummary
         title=notification.title,
         message=notification.message,
         is_read=notification.is_read,
-        created_at=notification.created_at,
+        created_at=(
+            notification.created_at.replace(tzinfo=UTC)
+            if notification.created_at.tzinfo is None
+            else notification.created_at.astimezone(UTC)
+        ),
     )
 
 
@@ -542,6 +585,37 @@ class AuthService:
             ) from error
         return _landowner_document_summary(document)
 
+    def upload_landowner_supporting_document(
+        self,
+        token: str | None,
+        application_id: int,
+        original_filename: str,
+        mime_type: str,
+        content: bytes,
+    ) -> LandownerDocumentSummary:
+        """Append a private supporting document to an application awaiting corrections."""
+        principal = self.require_role(token, "landowner")
+        stored_document = self._document_storage.store(original_filename, mime_type, content)
+        try:
+            document = self._database.add_landowner_supporting_document(
+                user_id=principal.user_id,
+                application_id=application_id,
+                original_filename=stored_document.original_filename,
+                stored_path=stored_document.stored_path,
+                document_sha256=stored_document.document_sha256,
+                mime_type=stored_document.mime_type,
+            )
+        except Exception as error:
+            try:
+                self._document_storage.delete(stored_document.stored_path)
+            except Exception as cleanup_error:
+                error.add_note(
+                    "Could not remove supporting file after database failure: "
+                    f"{cleanup_error}"
+                )
+            raise
+        return _landowner_document_summary(document)
+
     def submit_landowner_application(
         self, token: str | None, application_id: int
     ) -> ApplicationSubmission:
@@ -564,6 +638,49 @@ class AuthService:
         except PermissionError as error:
             raise AuthorizationError(
                 "You are not authorized to submit this application."
+            ) from error
+        return _application_submission(submission)
+
+    def resubmit_landowner_application(
+        self,
+        token: str | None,
+        application_id: int,
+        corrected_fields: Mapping[str, object] | None = None,
+    ) -> ApplicationSubmission:
+        principal = self.require_role(token, "landowner")
+        detail = self._database.get_landowner_application(
+            principal.user_id, application_id
+        )
+        if detail is None:
+            raise AuthorizationError("You are not authorized to resubmit this application.")
+        if detail.status != "corrections_requested":
+            raise ValueError(
+                "This application is not awaiting corrections and cannot be resubmitted."
+            )
+        corrected_values = (
+            detail.corrected_fields_json
+            if corrected_fields is None
+            else {
+                field_name: (
+                    value.strip() or None
+                    if isinstance(value, str)
+                    else value
+                )
+                for field_name, value in corrected_fields.items()
+            }
+        )
+        errors = validate_corrected_fields(corrected_values)
+        if errors:
+            raise ValueError("\n".join(errors))
+        try:
+            submission = self._database.resubmit_landowner_application(
+                user_id=principal.user_id,
+                application_id=application_id,
+                corrected_fields_json=corrected_values,
+            )
+        except PermissionError as error:
+            raise AuthorizationError(
+                "You are not authorized to resubmit this application."
             ) from error
         return _application_submission(submission)
 
@@ -615,6 +732,16 @@ class AuthService:
             _notification_summary(notification)
             for notification in self._database.list_landowner_notifications(principal.user_id)
         )
+
+    def mark_landowner_notification_read(
+        self, token: str | None, notification_id: int
+    ) -> None:
+        principal = self.require_role(token, "landowner")
+        if not self._database.mark_landowner_notification_read(
+            user_id=principal.user_id,
+            notification_id=notification_id,
+        ):
+            raise AuthorizationError("You are not authorized to access this notification.")
 
     def list_landowner_approved_records(
         self, token: str | None
@@ -792,6 +919,32 @@ class AuthService:
             id=result.id,
             application_number=result.application_number,
             status=result.status,
+        )
+
+    def decide_officer_application(
+        self,
+        token: str | None,
+        application_id: int,
+        decision: str,
+        comments: str | None = None,
+    ) -> ApplicationDecision:
+        principal = self.require_role(token, "officer")
+        try:
+            result: ApplicationDecisionData = self._database.decide_officer_application(
+                officer_id=principal.user_id,
+                application_id=application_id,
+                decision=decision,
+                comments=comments,
+            )
+        except PermissionError as error:
+            raise AuthorizationError(str(error)) from error
+        return ApplicationDecision(
+            application_id=result.application_id,
+            application_number=result.application_number,
+            decision=result.decision,
+            status=result.status,
+            decided_at=result.decided_at,
+            public_record_id=result.public_record_id,
         )
 
     def list_approved_registry(

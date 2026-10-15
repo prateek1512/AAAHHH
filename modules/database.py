@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Iterator, Sequence
+from uuid import uuid4
 
 from sqlalchemy import (
     JSON,
@@ -31,7 +32,9 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy.engine import Engine, make_url
-from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, joinedload, mapped_column, relationship, sessionmaker
+
+from modules.field_validation import validate_corrected_fields
 
 DEFAULT_DATABASE_URL = "sqlite:///./data/land_records.db"
 DATABASE_URL_ENV = "LAND_RECORDS_DATABASE_URL"
@@ -384,6 +387,18 @@ class LandownerApplicationDetailData:
     current_version: int
     corrected_fields_json: dict[str, object]
     document_filenames: tuple[str, ...]
+    document_ids: tuple[int, ...]
+    review_events: tuple[LandownerReviewEventData, ...]
+    public_record_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class LandownerReviewEventData:
+    id: int
+    decision: str
+    comments: str | None
+    created_at: datetime
+    officer_name: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -412,6 +427,16 @@ class OfficerDocumentData:
     stored_path: str
     mime_type: str
     uploaded_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class ApplicationDecisionData:
+    application_id: int
+    application_number: str
+    decision: str
+    status: str
+    decided_at: datetime
+    public_record_id: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -502,6 +527,27 @@ def _audit_event_hash(
         "created_at": _canonical_utc(created_at).isoformat(),
     }
     payload = json.dumps(event_data, sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _land_record_hash(
+    *,
+    public_record_id: str,
+    application_id: int,
+    current_version: int,
+    approved_fields_json: dict[str, object],
+    approved_by: int,
+    approved_at: datetime,
+) -> str:
+    record_data = {
+        "public_record_id": public_record_id,
+        "application_id": application_id,
+        "current_version": current_version,
+        "approved_fields_json": approved_fields_json,
+        "approved_by": approved_by,
+        "approved_at": _canonical_utc(approved_at).isoformat(),
+    }
+    payload = json.dumps(record_data, sort_keys=True, default=str)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -634,10 +680,16 @@ class Database:
                     ApplicationVersion.version_number == application.current_version,
                 )
             )
-            documents = session.scalars(
-                select(Document.original_filename)
+            documents = session.execute(
+                select(Document.id, Document.original_filename)
                 .where(Document.application_id == application.id)
                 .order_by(Document.uploaded_at, Document.id)
+            ).all()
+            review_events = session.execute(
+                select(ReviewEvent, User.full_name)
+                .join(User, ReviewEvent.officer_id == User.id)
+                .where(ReviewEvent.application_id == application.id)
+                .order_by(ReviewEvent.created_at, ReviewEvent.id)
             ).all()
             return LandownerApplicationDetailData(
                 id=application.id,
@@ -649,7 +701,23 @@ class Database:
                 corrected_fields_json=(
                     dict(version.corrected_fields_json) if version is not None else {}
                 ),
-                document_filenames=tuple(documents),
+                document_filenames=tuple(filename for _, filename in documents),
+                document_ids=tuple(document_id for document_id, _ in documents),
+                review_events=tuple(
+                    LandownerReviewEventData(
+                        id=event.id,
+                        decision=event.decision,
+                        comments=event.comments,
+                        created_at=event.created_at,
+                        officer_name=officer_name,
+                    )
+                    for event, officer_name in review_events
+                ),
+                public_record_id=(
+                    application.land_record.public_record_id
+                    if application.land_record is not None
+                    else None
+                ),
             )
 
     def create_landowner_application_document(
@@ -741,10 +809,9 @@ class Database:
             if document is None:
                 raise PermissionError("The document does not belong to this landowner.")
             application = document.application
-            if application.status != "draft":
+            if application.status not in ("draft", "corrections_requested"):
                 raise PermissionError(
-                    "Only draft applications can be edited; submitted and approved "
-                    "applications are immutable."
+                    "Only draft applications or applications requiring corrections can be edited."
                 )
             current_version = session.scalar(
                 select(ApplicationVersion).where(
@@ -752,6 +819,11 @@ class Database:
                     ApplicationVersion.version_number == application.current_version,
                 )
             )
+            if (
+                current_version is not None
+                and current_version.corrected_fields_json == corrected_fields_json
+            ):
+                return _document_data(document)
             extracted_fields_json = (
                 current_version.extracted_fields_json if current_version is not None else {}
             )
@@ -764,6 +836,40 @@ class Database:
             )
             application.current_version = version.version_number
             session.add(version)
+            session.flush()
+            return _document_data(document)
+
+    def add_landowner_supporting_document(
+        self,
+        *,
+        user_id: int,
+        application_id: int,
+        original_filename: str,
+        stored_path: str,
+        document_sha256: str,
+        mime_type: str,
+    ) -> DocumentData:
+        with transaction(self._session_factory) as session:
+            application = session.scalar(
+                select(Application).where(
+                    Application.id == application_id,
+                    Application.applicant_id == user_id,
+                )
+            )
+            if application is None:
+                raise PermissionError("The application does not belong to this landowner.")
+            if application.status != "corrections_requested":
+                raise PermissionError(
+                    "Supporting documents can only be added when corrections are requested."
+                )
+            document = Document(
+                application_id=application.id,
+                original_filename=original_filename,
+                stored_path=stored_path,
+                document_sha256=document_sha256,
+                mime_type=mime_type,
+            )
+            session.add(document)
             session.flush()
             return _document_data(document)
 
@@ -882,6 +988,176 @@ class Database:
                 corrected_fields_json=dict(snapshot.corrected_fields_json),
             )
 
+    def resubmit_landowner_application(
+        self,
+        *,
+        user_id: int,
+        application_id: int,
+        corrected_fields_json: dict[str, object] | None = None,
+    ) -> ApplicationSubmissionData:
+        """Create a new immutable submission snapshot after requested corrections."""
+        with transaction(self._session_factory) as session:
+            application = session.scalar(
+                select(Application).where(
+                    Application.id == application_id,
+                    Application.applicant_id == user_id,
+                )
+            )
+            if application is None:
+                raise PermissionError("The application does not belong to this landowner.")
+            if application.status != "corrections_requested":
+                raise ValueError(
+                    "This application is not awaiting corrections and cannot be resubmitted."
+                )
+
+            current_version = session.scalar(
+                select(ApplicationVersion).where(
+                    ApplicationVersion.application_id == application.id,
+                    ApplicationVersion.version_number == application.current_version,
+                )
+            )
+            if current_version is None:
+                raise ValueError("Save the revised application fields before resubmitting.")
+            if not session.scalar(
+                select(Document.id)
+                .where(Document.application_id == application.id)
+                .limit(1)
+            ):
+                raise ValueError("A supporting document is required before resubmission.")
+
+            submitted_at = utc_now()
+            source_version_number = current_version.version_number
+            revised_fields = dict(current_version.corrected_fields_json)
+            if (
+                corrected_fields_json is not None
+                and corrected_fields_json != current_version.corrected_fields_json
+            ):
+                source_version_number += 1
+                revised_fields = dict(corrected_fields_json)
+                session.add(
+                    ApplicationVersion(
+                        application_id=application.id,
+                        version_number=source_version_number,
+                        extracted_fields_json=dict(current_version.extracted_fields_json),
+                        corrected_fields_json=revised_fields,
+                        created_at=submitted_at,
+                        created_by=user_id,
+                    )
+                )
+            version_number = source_version_number + 1
+            snapshot = ApplicationVersion(
+                application_id=application.id,
+                version_number=version_number,
+                extracted_fields_json=dict(current_version.extracted_fields_json),
+                corrected_fields_json=revised_fields,
+                created_at=submitted_at,
+                created_by=user_id,
+            )
+            session.add(snapshot)
+            updated_application_id = session.scalar(
+                update(Application)
+                .where(
+                    Application.id == application.id,
+                    Application.applicant_id == user_id,
+                    Application.status == "corrections_requested",
+                    Application.current_version == current_version.version_number,
+                )
+                .values(
+                    status="submitted",
+                    submitted_at=submitted_at,
+                    updated_at=submitted_at,
+                    current_version=version_number,
+                )
+                .returning(Application.id)
+            )
+            if updated_application_id is None:
+                raise ValueError(
+                    "This application was already resubmitted or has changed. Refresh and try again."
+                )
+
+            previous_event = session.scalar(
+                select(AuditEvent)
+                .order_by(AuditEvent.id.desc())
+                .limit(1)
+                .with_for_update()
+            )
+            previous_event_hash = previous_event.event_hash if previous_event else None
+            audit_data: dict[str, object] = {
+                "application_number": application.application_number,
+                "version_number": version_number,
+            }
+            event_type = "application_resubmitted"
+            event_hash = _audit_event_hash(
+                event_type=event_type,
+                actor_id=user_id,
+                application_id=application.id,
+                land_record_id=None,
+                event_data_json=audit_data,
+                previous_event_hash=previous_event_hash,
+                created_at=submitted_at,
+            )
+            session.add(
+                AuditEvent(
+                    event_type=event_type,
+                    actor_id=user_id,
+                    application_id=application.id,
+                    event_data_json=audit_data,
+                    previous_event_hash=previous_event_hash,
+                    event_hash=event_hash,
+                    created_at=submitted_at,
+                )
+            )
+            session.add(
+                Notification(
+                    user_id=user_id,
+                    application_id=application.id,
+                    title="Application resubmitted",
+                    message=(
+                        f"Application {application.application_number} was resubmitted "
+                        "and is ready for review."
+                    ),
+                    created_at=submitted_at,
+                )
+            )
+            officers = session.scalars(
+                select(User).where(User.role == "officer", User.is_active.is_(True))
+            ).all()
+            assigned_officer = next(
+                (
+                    officer
+                    for officer in officers
+                    if officer.id == application.assigned_officer_id
+                ),
+                None,
+            )
+            recipients = (
+                (assigned_officer,)
+                if assigned_officer is not None
+                else tuple(officers)
+            )
+            for officer in recipients:
+                session.add(
+                    Notification(
+                        user_id=officer.id,
+                        application_id=application.id,
+                        title="Application ready for review",
+                        message=(
+                            f"Application {application.application_number} was resubmitted "
+                            "after corrections and is ready for review."
+                        ),
+                        created_at=submitted_at,
+                    )
+                )
+            session.flush()
+            return ApplicationSubmissionData(
+                id=application.id,
+                application_number=application.application_number,
+                status="submitted",
+                submitted_at=submitted_at,
+                current_version=version_number,
+                corrected_fields_json=dict(snapshot.corrected_fields_json),
+            )
+
     def list_landowner_documents(self, user_id: int) -> tuple[DocumentData, ...]:
         with self._session_factory() as session:
             documents = session.scalars(
@@ -924,6 +1200,29 @@ class Database:
                 )
                 for notification in notifications
             )
+
+    def mark_landowner_notification_read(
+        self, *, user_id: int, notification_id: int
+    ) -> bool:
+        with transaction(self._session_factory) as session:
+            updated_id = session.scalar(
+                update(Notification)
+                .where(
+                    Notification.id == notification_id,
+                    Notification.user_id == user_id,
+                    Notification.is_read.is_(False),
+                )
+                .values(is_read=True)
+                .returning(Notification.id)
+            )
+            if updated_id is not None:
+                return True
+            return session.scalar(
+                select(Notification.id).where(
+                    Notification.id == notification_id,
+                    Notification.user_id == user_id,
+                )
+            ) is not None
 
     def count_landowner_applications_by_status(self, user_id: int) -> dict[str, int]:
         with self._session_factory() as session:
@@ -1002,6 +1301,19 @@ class Database:
             return application.assigned_officer_id == officer_id or (
                 policy == "assigned_or_unassigned"
                 and application.assigned_officer_id is None
+            )
+
+    def officer_can_view_application(
+        self, officer_id: int, application_id: int, policy: str
+    ) -> bool:
+        if self.officer_can_review(officer_id, application_id, policy):
+            return True
+        with self._session_factory() as session:
+            application = session.get(Application, application_id)
+            return bool(
+                application is not None
+                and application.assigned_officer_id == officer_id
+                and application.status in ("approved", "rejected")
             )
 
     def count_officer_dashboard_metrics(self, officer_id: int, policy: str) -> dict[str, int]:
@@ -1155,7 +1467,7 @@ class Database:
 
     def get_application_for_review(self, officer_id: int, application_id: int, policy: str):
         """Get detailed application data for review, if officer is authorized."""
-        if not self.officer_can_review(officer_id, application_id, policy):
+        if not self.officer_can_view_application(officer_id, application_id, policy):
             return None
         with self._session_factory() as session:
             application = session.get(Application, application_id)
@@ -1184,6 +1496,7 @@ class Database:
             # Get review events
             review_events = session.scalars(
                 select(ReviewEvent)
+                .options(joinedload(ReviewEvent.officer))
                 .where(ReviewEvent.application_id == application_id)
                 .order_by(ReviewEvent.created_at.desc())
             ).all()
@@ -1204,7 +1517,7 @@ class Database:
         document_id: int,
         policy: str,
     ) -> OfficerDocumentData | None:
-        if not self.officer_can_review(officer_id, application_id, policy):
+        if not self.officer_can_view_application(officer_id, application_id, policy):
             return None
         with self._session_factory() as session:
             document = session.scalar(
@@ -1241,7 +1554,8 @@ class Database:
                 "corrections_requested",
             ):
                 raise ValueError("The application is no longer available for review.")
-            if application.assigned_officer_id == officer_id:
+            already_assigned = application.assigned_officer_id == officer_id
+            if already_assigned and application.status != "submitted":
                 return OfficerReviewStartedData(
                     id=application.id,
                     application_number=application.application_number,
@@ -1249,30 +1563,38 @@ class Database:
                     assigned_officer_id=officer_id,
                 )
             if application.assigned_officer_id is not None:
-                raise PermissionError("This application is assigned to another officer.")
-            if policy == "assigned_only":
+                if not already_assigned:
+                    raise PermissionError("This application is assigned to another officer.")
+            elif policy == "assigned_only":
                 raise PermissionError("You are not authorized to claim this application.")
 
             previous_status = application.status
             review_status = "under_review" if previous_status == "submitted" else previous_status
             now = utc_now()
+            assignment_filter = (
+                Application.assigned_officer_id == officer_id
+                if already_assigned
+                else Application.assigned_officer_id.is_(None)
+            )
+            update_values: dict[str, object] = {
+                "status": review_status,
+                "updated_at": now,
+            }
+            if not already_assigned:
+                update_values["assigned_officer_id"] = officer_id
             claimed_id = session.scalar(
                 update(Application)
                 .where(
                     Application.id == application_id,
-                    Application.assigned_officer_id.is_(None),
+                    assignment_filter,
                     Application.status == previous_status,
                 )
-                .values(
-                    assigned_officer_id=officer_id,
-                    status=review_status,
-                    updated_at=now,
-                )
+                .values(**update_values)
                 .returning(Application.id)
             )
             if claimed_id is None:
                 raise PermissionError(
-                    "Another officer claimed this application before your assignment completed."
+                    "The application changed before review could begin. Refresh and try again."
                 )
 
             previous_event = session.scalar(
@@ -1311,6 +1633,195 @@ class Database:
                 application_number=application.application_number,
                 status=review_status,
                 assigned_officer_id=officer_id,
+            )
+
+    def decide_officer_application(
+        self,
+        *,
+        officer_id: int,
+        application_id: int,
+        decision: str,
+        comments: str | None,
+    ) -> ApplicationDecisionData:
+        if decision not in {"approve", "reject", "request_corrections"}:
+            raise ValueError("Unsupported application decision.")
+        clean_comments = comments.strip() if comments else ""
+        if decision in {"reject", "request_corrections"} and len(clean_comments) < 10:
+            requirement = "rejection reason" if decision == "reject" else "correction instructions"
+            raise ValueError(f"Provide a meaningful {requirement} of at least 10 characters.")
+
+        with transaction(self._session_factory) as session:
+            application = session.get(Application, application_id)
+            if (
+                application is None
+                or application.status != "under_review"
+                or application.assigned_officer_id != officer_id
+            ):
+                raise PermissionError(
+                    "The application is no longer assigned to you for an active review."
+                )
+            if application.land_record is not None:
+                raise ValueError("An approved land record already exists; it cannot be overwritten.")
+
+            version = session.scalar(
+                select(ApplicationVersion).where(
+                    ApplicationVersion.application_id == application_id,
+                    ApplicationVersion.version_number == application.current_version,
+                )
+            )
+            if version is None:
+                raise ValueError("The current application version is unavailable.")
+            documents = session.scalar(
+                select(func.count(Document.id)).where(
+                    Document.application_id == application_id
+                )
+            ) or 0
+
+            if decision == "approve":
+                validation_errors = validate_corrected_fields(version.corrected_fields_json)
+                if validation_errors:
+                    raise ValueError(
+                        "Approval requires valid owner-reviewed fields: "
+                        + " ".join(validation_errors)
+                    )
+                if documents < 1:
+                    raise ValueError("Approval requires at least one supporting document.")
+
+            decided_at = utc_now()
+            status_by_decision = {
+                "approve": "approved",
+                "reject": "rejected",
+                "request_corrections": "corrections_requested",
+            }
+            new_status = status_by_decision[decision]
+            result_id = session.scalar(
+                update(Application)
+                .where(
+                    Application.id == application_id,
+                    Application.status == "under_review",
+                    Application.assigned_officer_id == officer_id,
+                )
+                .values(
+                    status=new_status,
+                    rejection_reason=clean_comments if decision == "reject" else None,
+                    updated_at=decided_at,
+                )
+                .returning(Application.id)
+            )
+            if result_id is None:
+                raise PermissionError(
+                    "The application status changed before your decision was saved. "
+                    "Refresh and review the current application."
+                )
+
+            public_record_id: str | None = None
+            land_record: LandRecord | None = None
+            if decision == "approve":
+                public_record_id = f"LR-REC-{decided_at:%Y}-{uuid4().hex[:8].upper()}"
+                approved_fields = dict(version.corrected_fields_json)
+                record_hash = _land_record_hash(
+                    public_record_id=public_record_id,
+                    application_id=application_id,
+                    current_version=version.version_number,
+                    approved_fields_json=approved_fields,
+                    approved_by=officer_id,
+                    approved_at=decided_at,
+                )
+                land_record = LandRecord(
+                    application_id=application_id,
+                    public_record_id=public_record_id,
+                    current_version=version.version_number,
+                    approved_fields_json=approved_fields,
+                    current_record_hash=record_hash,
+                    approved_at=decided_at,
+                    approved_by=officer_id,
+                    is_public=False,
+                )
+                session.add(land_record)
+                session.flush()
+
+            review_event = ReviewEvent(
+                application_id=application_id,
+                officer_id=officer_id,
+                decision=decision,
+                comments=clean_comments or None,
+                created_at=decided_at,
+            )
+            session.add(review_event)
+
+            previous_event = session.scalar(
+                select(AuditEvent)
+                .order_by(AuditEvent.id.desc())
+                .limit(1)
+                .with_for_update()
+            )
+            previous_event_hash = previous_event.event_hash if previous_event else None
+            audit_data: dict[str, object] = {
+                "application_number": application.application_number,
+                "decision": decision,
+                "previous_status": "under_review",
+                "status": new_status,
+                "comments": clean_comments or None,
+                "public_record_id": public_record_id,
+                "version_number": version.version_number,
+            }
+            event_hash = _audit_event_hash(
+                event_type=f"application_{decision}",
+                actor_id=officer_id,
+                application_id=application_id,
+                land_record_id=land_record.id if land_record else None,
+                event_data_json=audit_data,
+                previous_event_hash=previous_event_hash,
+                created_at=decided_at,
+            )
+            session.add(
+                AuditEvent(
+                    event_type=f"application_{decision}",
+                    actor_id=officer_id,
+                    application_id=application_id,
+                    land_record_id=land_record.id if land_record else None,
+                    event_data_json=audit_data,
+                    previous_event_hash=previous_event_hash,
+                    event_hash=event_hash,
+                    created_at=decided_at,
+                )
+            )
+
+            if decision == "approve":
+                title = "Application approved"
+                message = (
+                    f"Application {application.application_number} was approved. "
+                    f"Your record reference is {public_record_id}."
+                )
+            elif decision == "reject":
+                title = "Application rejected"
+                message = (
+                    f"Application {application.application_number} was rejected. "
+                    f"Reason: {clean_comments}"
+                )
+            else:
+                title = "Corrections requested"
+                message = (
+                    f"Application {application.application_number} requires corrections. "
+                    f"Instructions: {clean_comments}"
+                )
+            session.add(
+                Notification(
+                    user_id=application.applicant_id,
+                    application_id=application_id,
+                    title=title,
+                    message=message,
+                    created_at=decided_at,
+                )
+            )
+            session.flush()
+            return ApplicationDecisionData(
+                application_id=application_id,
+                application_number=application.application_number,
+                decision=decision,
+                status=new_status,
+                decided_at=decided_at,
+                public_record_id=public_record_id,
             )
 
     def list_approved_registry(

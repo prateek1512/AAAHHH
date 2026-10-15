@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from datetime import timezone
 from io import BytesIO
 
 import pytest
@@ -16,6 +17,9 @@ from modules.database import (
     Base,
     Database,
     Document,
+    LandRecord,
+    Notification,
+    ReviewEvent,
     User,
     create_database_engine,
     transaction,
@@ -288,3 +292,233 @@ def test_stale_or_ineligible_application_cannot_be_claimed(
         service.start_officer_application_review(
             tokens["officer"], ids["unassigned_application"]
         )
+
+
+def test_officer_approval_creates_approved_record_and_side_effects(
+    review_context: tuple[sessionmaker[Session], AuthService, dict[str, str], dict[str, int]],
+) -> None:
+    session_factory, service, tokens, ids = review_context
+    application_id = ids["assigned_application"]
+
+    result = service.decide_officer_application(
+        tokens["officer"],
+        application_id,
+        "approve",
+    )
+
+    assert result.status == "approved"
+    assert result.public_record_id is not None
+    assert result.public_record_id.startswith("LR-REC-2026-")
+    records = service.list_approved_registry(tokens["officer"])
+    assert len(records) == 1
+    assert records[0].public_record_id == result.public_record_id
+    with session_factory() as session:
+        application = session.get(Application, application_id)
+        assert application is not None
+        assert application.status == "approved"
+        assert application.land_record is not None
+        record = session.scalar(
+            select(LandRecord).where(LandRecord.application_id == application_id)
+        )
+        assert record is not None
+        assert record.current_version == application.current_version
+        assert record.approved_by == ids["officer"]
+        assert record.approved_at.replace(tzinfo=result.decided_at.tzinfo) == result.decided_at
+        assert record.approved_fields_json["owner_name"] == "Synthetic Owner"
+        assert len(record.current_record_hash) == 64
+        review_event = session.scalar(
+            select(ReviewEvent).where(
+                ReviewEvent.application_id == application_id,
+                ReviewEvent.decision == "approve",
+            )
+        )
+        assert review_event is not None
+        assert review_event.officer_id == ids["officer"]
+        assert review_event.created_at.replace(tzinfo=timezone.utc) == result.decided_at
+        notification = session.scalar(
+            select(Notification).where(Notification.application_id == application_id)
+        )
+        assert notification is not None
+        assert notification.user_id == ids["owner"]
+        assert result.public_record_id in notification.message
+        audit_event = session.scalar(
+            select(AuditEvent).where(
+                AuditEvent.application_id == application_id,
+                AuditEvent.event_type == "application_approve",
+            )
+        )
+        assert audit_event is not None
+        assert audit_event.land_record_id == record.id
+        assert audit_event.actor_id == ids["officer"]
+        assert audit_event.created_at.replace(tzinfo=timezone.utc) == result.decided_at
+
+    audit_events = service.list_audit_events(
+        tokens["officer"], application_id=application_id
+    )
+    assert any(
+        event.event_type == "application_approve" and event.integrity_verified
+        for event in audit_events
+    )
+
+    with pytest.raises(AuthorizationError, match="active review"):
+        service.decide_officer_application(tokens["officer"], application_id, "approve")
+    assert len(service.list_approved_registry(tokens["officer"])) == 1
+
+
+@pytest.mark.parametrize(
+    ("decision", "comments", "expected_status", "expected_title"),
+    [
+        (
+            "reject",
+            "Survey number does not match the attached instrument.",
+            "rejected",
+            "Application rejected",
+        ),
+        (
+            "request_corrections",
+            "Please provide the corrected survey number and area unit.",
+            "corrections_requested",
+            "Corrections requested",
+        ),
+    ],
+)
+def test_rejection_and_correction_request_persist_history_and_notification(
+    review_context: tuple[sessionmaker[Session], AuthService, dict[str, str], dict[str, int]],
+    decision: str,
+    comments: str,
+    expected_status: str,
+    expected_title: str,
+) -> None:
+    session_factory, service, tokens, ids = review_context
+    application_id = ids["assigned_application"]
+
+    result = service.decide_officer_application(
+        tokens["officer"],
+        application_id,
+        decision,
+        comments,
+    )
+
+    assert result.status == expected_status
+    assert result.public_record_id is None
+    assert service.list_approved_registry(tokens["officer"]) == ()
+    with session_factory() as session:
+        application = session.get(Application, application_id)
+        assert application is not None
+        assert application.status == expected_status
+        assert application.land_record is None
+        if decision == "reject":
+            assert application.rejection_reason == comments
+        review_event = session.scalar(
+            select(ReviewEvent).where(
+                ReviewEvent.application_id == application_id,
+                ReviewEvent.decision == decision,
+            )
+        )
+        assert review_event is not None
+        assert review_event.comments == comments
+        assert review_event.officer_id == ids["officer"]
+        notification = session.scalar(
+            select(Notification).where(Notification.application_id == application_id)
+        )
+        assert notification is not None
+        assert notification.user_id == ids["owner"]
+        assert notification.title == expected_title
+        assert comments in notification.message
+        audit_event = session.scalar(
+            select(AuditEvent).where(
+                AuditEvent.application_id == application_id,
+                AuditEvent.event_type == f"application_{decision}",
+            )
+        )
+        assert audit_event is not None
+        assert audit_event.actor_id == ids["officer"]
+        assert audit_event.event_data_json["decision"] == decision
+
+    detail = service.get_application_for_review(tokens["officer"], application_id)
+    assert detail is not None
+    assert any(event.decision == decision and event.comments == comments for event in detail.review_events)
+    if decision == "reject":
+        owner_detail = service.get_landowner_application(tokens["owner"], application_id)
+        assert owner_detail.status == "rejected"
+        assert owner_detail.review_events[-1].decision == "reject"
+        assert owner_detail.review_events[-1].comments == comments
+
+
+def test_decisions_require_explanations_and_approval_checks_fields_and_documents(
+    review_context: tuple[sessionmaker[Session], AuthService, dict[str, str], dict[str, int]],
+) -> None:
+    session_factory, service, tokens, ids = review_context
+    application_id = ids["assigned_application"]
+
+    with pytest.raises(ValueError, match="meaningful rejection reason"):
+        service.decide_officer_application(tokens["officer"], application_id, "reject", "no")
+    with pytest.raises(ValueError, match="meaningful correction instructions"):
+        service.decide_officer_application(
+            tokens["officer"], application_id, "request_corrections", "fix"
+        )
+    with transaction(session_factory) as session:
+        version = session.scalar(
+            select(ApplicationVersion).where(
+                ApplicationVersion.application_id == application_id,
+                ApplicationVersion.version_number == 1,
+            )
+        )
+        assert version is not None
+        version.corrected_fields_json = {
+            **version.corrected_fields_json,
+            "land_area": "unknown",
+        }
+    with pytest.raises(ValueError, match="[Ll]and area"):
+        service.decide_officer_application(tokens["officer"], application_id, "approve")
+
+    with transaction(session_factory) as session:
+        version = session.scalar(
+            select(ApplicationVersion).where(
+                ApplicationVersion.application_id == application_id,
+                ApplicationVersion.version_number == 1,
+            )
+        )
+        assert version is not None
+        version.corrected_fields_json = {
+            **version.corrected_fields_json,
+            "land_area": "2 acres",
+        }
+        session.query(Document).filter(Document.application_id == application_id).delete()
+    with pytest.raises(ValueError, match="supporting document"):
+        service.decide_officer_application(tokens["officer"], application_id, "approve")
+
+    with session_factory() as session:
+        application = session.get(Application, application_id)
+        assert application is not None
+        assert application.status == "under_review"
+        assert application.land_record is None
+        assert session.scalar(
+            select(func.count()).select_from(ReviewEvent).where(
+                ReviewEvent.application_id == application_id
+            )
+        ) == 0
+
+
+def test_landowner_cannot_approve_even_by_calling_decision_service(
+    review_context: tuple[sessionmaker[Session], AuthService, dict[str, str], dict[str, int]],
+) -> None:
+    session_factory, service, tokens, ids = review_context
+
+    with pytest.raises(AuthorizationError):
+        service.decide_officer_application(
+            tokens["owner"],
+            ids["assigned_application"],
+            "approve",
+        )
+
+    with session_factory() as session:
+        application = session.get(Application, ids["assigned_application"])
+        assert application is not None
+        assert application.status == "under_review"
+        assert application.land_record is None
+        assert session.scalar(
+            select(func.count()).select_from(ReviewEvent).where(
+                ReviewEvent.application_id == ids["assigned_application"]
+            )
+        ) == 0
