@@ -89,6 +89,7 @@ with st.sidebar:
 
 def _navigate_to_upload() -> None:
     st.session_state["landowner_page"] = "Upload Land Document"
+    st.session_state.pop("active_upload_document_id", None)
 
 
 def _navigate_to_applications() -> None:
@@ -275,6 +276,7 @@ def _upload_document() -> None:
             except DocumentStorageError as error:
                 st.error(str(error))
             else:
+                st.session_state["active_upload_document_id"] = document.id
                 st.success(
                     f"Uploaded **{document.original_filename}** to draft "
                     f"application **{document.application_number}**."
@@ -285,14 +287,40 @@ def _upload_document() -> None:
                     else "unavailable"
                 )
                 st.info(f"OCR processing status: {ocr_status}")
+                st.rerun()
 
-    st.subheader("Your uploaded documents")
+    active_doc_id = st.session_state.get("active_upload_document_id")
     documents = service.list_landowner_documents(token)
-    if not documents:
-        st.info("No documents uploaded yet.")
+    draft_documents = [d for d in documents if d.application_status == "draft"]
+
+    if not active_doc_id:
+        st.info("Upload a land document above to run OCR and begin a new draft application.")
+        if draft_documents:
+            with st.expander(f"Or continue editing a saved draft ({len(draft_documents)})"):
+                for draft in draft_documents:
+                    col_d1, col_d2 = st.columns([3, 1])
+                    with col_d1:
+                        st.write(f"**{draft.application_number}** · {draft.original_filename}")
+                    with col_d2:
+                        if st.button("Open draft", key=f"open_draft_{draft.id}"):
+                            st.session_state["active_upload_document_id"] = draft.id
+                            st.rerun()
         return
-    for document in documents:
-        with st.container(border=True):
+
+    document = next((d for d in documents if d.id == active_doc_id), None)
+    if document is None:
+        st.session_state.pop("active_upload_document_id", None)
+        return
+
+    col_header, col_action = st.columns([3, 1])
+    with col_header:
+        st.subheader(f"Current Draft: {document.original_filename}")
+    with col_action:
+        if st.button("＋ Upload another document"):
+            st.session_state.pop("active_upload_document_id", None)
+            st.rerun()
+
+    with st.container(border=True):
             st.text(document.original_filename)
             st.caption(
                 f"Application {document.application_number} · "
@@ -418,7 +446,7 @@ def _upload_document() -> None:
                 for field_name, label in field_labels:
                     value = corrected_fields.get(field_name)
                     st.write(f"**{label}:** {value if isinstance(value, str) and value else 'Not provided'}")
-                continue
+                return
             if document.application_status != "draft":
                 st.info(
                     "This application has been submitted and is pending verification. "
@@ -427,7 +455,7 @@ def _upload_document() -> None:
                 for field_name, label in field_labels:
                     value = corrected_fields.get(field_name)
                     st.write(f"**{label}:** {value if isinstance(value, str) and value else 'Not provided'}")
-                continue
+                return
 
             st.subheader("Review extracted fields")
             st.caption(
@@ -549,14 +577,14 @@ def _upload_document() -> None:
                 )
             except AuthorizationError as error:
                 st.error(str(error))
-                continue
+                return
             except SQLAlchemyError:
                 logger.exception(
                     "Database error checking application discrepancies for %s",
                     document.application_id,
                 )
                 st.error("Discrepancy checks are currently unavailable.")
-                continue
+                return
             _render_discrepancy_warnings(
                 application_detail.discrepancy_warnings,
                 title="Submission checks",
@@ -589,6 +617,7 @@ def _upload_document() -> None:
                         f"Application **{submission.application_number}** was submitted "
                         f"successfully. Current status: **{_status_label(submission.status)}**."
                     )
+                    st.session_state.pop("active_upload_document_id", None)
                     st.rerun()
 
 

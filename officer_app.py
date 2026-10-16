@@ -93,6 +93,16 @@ with st.sidebar:
     )
 
 
+def _navigate_to(page: str) -> None:
+    st.session_state["officer_page"] = page
+
+
+def _open_application_for_review(application_id: int) -> None:
+    st.session_state["selected_review_application_id"] = application_id
+    st.session_state["officer_page"] = "Application Review"
+    st.query_params["app_id"] = str(application_id)
+
+
 def _status_label(status: str) -> str:
     return {
         "draft": "Draft",
@@ -154,15 +164,13 @@ def _application_row(application: OfficerApplicationSummary) -> None:
                 if application.submitted_at
                 else "—"
             )
-        if st.button(
+        st.button(
             "Open application",
             key=f"open_review_{application.id}",
             type="primary",
-        ):
-            st.session_state["selected_review_application_id"] = application.id
-            st.session_state["officer_page"] = "Application Review"
-            st.query_params["app_id"] = str(application.id)
-            st.rerun()
+            on_click=_open_application_for_review,
+            args=(application.id,),
+        )
 
 
 def _render_applications(applications: tuple[OfficerApplicationSummary, ...]) -> None:
@@ -183,17 +191,27 @@ def _dashboard() -> None:
     st.subheader("Quick actions")
     col1, col2, col3 = st.columns(3)
     with col1:
-        if st.button("📋 View Review Queue", type="primary", use_container_width=True):
-            st.session_state["officer_page"] = "Review Queue"
-            st.rerun()
+        st.button(
+            "📋 View Review Queue",
+            type="primary",
+            use_container_width=True,
+            on_click=_navigate_to,
+            args=("Review Queue",),
+        )
     with col2:
-        if st.button("📁 Approved Registry", use_container_width=True):
-            st.session_state["officer_page"] = "Approved Registry"
-            st.rerun()
+        st.button(
+            "📁 Approved Registry",
+            use_container_width=True,
+            on_click=_navigate_to,
+            args=("Approved Registry",),
+        )
     with col3:
-        if st.button("🔍 Audit Explorer", use_container_width=True):
-            st.session_state["officer_page"] = "Audit Explorer"
-            st.rerun()
+        st.button(
+            "🔍 Audit Explorer",
+            use_container_width=True,
+            on_click=_navigate_to,
+            args=("Audit Explorer",),
+        )
 
 
 def _review_queue() -> None:
@@ -284,7 +302,7 @@ def _application_review() -> None:
     officer = service.require_role(token, "officer")
     if detail.assigned_officer_id is None:
         if detail.status in {"submitted", "under_review", "corrections_requested"}:
-            if st.button("Assign to me and start review", type="primary"):
+            if st.button("Assign to me and start review", type="primary", key=f"claim_top_{detail.id}"):
                 try:
                     review_started = service.start_officer_application_review(token, detail.id)
                 except (AuthorizationError, ValueError) as error:
@@ -303,7 +321,7 @@ def _application_review() -> None:
         if (
             detail.assigned_officer_id == officer.user_id
             and detail.status == "submitted"
-            and st.button("Start review", type="primary")
+            and st.button("Start review", type="primary", key=f"start_top_{detail.id}")
         ):
             try:
                 review_started = service.start_officer_application_review(
@@ -580,10 +598,62 @@ def _application_review() -> None:
         )
 
     st.divider()
-    if detail.status != "under_review":
-        st.info("A decision is available only while the application is under review.")
+    if detail.status == "corrections_requested":
+        st.subheader("Record a review decision")
+        st.warning(
+            "⏳ **Awaiting Landowner Resubmission**: Corrections were requested on this application. "
+            "An official approval or rejection decision can only be recorded after the landowner revises their "
+            "fields and resubmits the application from the Landowner Portal."
+        )
+        with st.expander("How to complete this workflow step in the demo"):
+            st.markdown(
+                "1. Switch to the **Landowner Portal** ([http://localhost:8502](http://localhost:8502)) and sign in as `demo.landowner@example.test`.\n"
+                f"2. Navigate to **My Applications** and select **{detail.application_number}**.\n"
+                "3. Review the officer's requested correction remarks, modify the land fields, and click **Save changes and resubmit for review**.\n"
+                "4. Return to this Officer Portal: the application status will now be **Submitted**.\n"
+                "5. Click **Start review** to unlock the Approve decision form."
+            )
+    elif detail.status == "submitted":
+        st.subheader("Record a review decision")
+        st.info(
+            "This application has been submitted / resubmitted and is awaiting active review. "
+            "Start active review to record an approval, rejection, or correction request."
+        )
+        claim_label = (
+            "Start review"
+            if detail.assigned_officer_id == officer.user_id
+            else "Assign to me and start review"
+        )
+        if st.button(
+            f"▶ {claim_label}",
+            type="primary",
+            key=f"start_review_decision_sec_{detail.id}",
+        ):
+            try:
+                review_started = service.start_officer_application_review(token, detail.id)
+            except (AuthorizationError, ValueError) as error:
+                st.error(str(error))
+            else:
+                st.success(f"Review started. Current status: {_status_label(review_started.status)}.")
+                st.rerun()
     elif detail.assigned_officer_id != officer.user_id:
+        st.subheader("Record a review decision")
         st.info("Assign the application to yourself before making a decision.")
+        if st.button(
+            "▶ Assign to me and start review",
+            type="primary",
+            key=f"assign_decision_sec_{detail.id}",
+        ):
+            try:
+                review_started = service.start_officer_application_review(token, detail.id)
+            except (AuthorizationError, ValueError) as error:
+                st.error(str(error))
+            else:
+                st.success(f"Assigned to you. Current status: {_status_label(review_started.status)}.")
+                st.rerun()
+    elif detail.status != "under_review":
+        st.subheader("Record a review decision")
+        st.info(f"A decision is not available for applications in {_status_label(detail.status)} status.")
     else:
         st.subheader("Record a review decision")
         st.caption(
