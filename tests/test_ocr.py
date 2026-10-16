@@ -93,6 +93,15 @@ def test_field_extraction_is_labeled_conservative_and_preserves_uncertainty() ->
     assert any("do not indicate" in warning for warning in result.warnings)
 
 
+def test_malformed_extracted_area_is_preserved_for_field_warning() -> None:
+    result = extract_fields(
+        [OCRLine("Land area: approximately two acres", confidence=73.5)]
+    )
+
+    assert result.fields["land_area"] == "approximately two acres"
+    assert result.confidence["land_area"] == 73.5
+
+
 def test_pdf_pages_are_rendered_and_ocr_text_is_combined(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -242,6 +251,11 @@ def test_upload_persists_ocr_output_separately_from_manual_corrections(
         )
         assert version is not None
         assert version.extracted_fields_json["ocr_text"] == "Owner name: OCR Owner"
+        assert version.extracted_fields_json["warning_threshold"] == 60
+        assert any(
+            warning["field"] == "district" and warning["code"] == "missing_required"
+            for warning in version.extracted_fields_json["field_warnings"]
+        )
         assert version.corrected_fields_json["owner_name"] == "Corrected Owner"
         original_version = session.scalar(
             select(ApplicationVersion).where(
@@ -251,6 +265,59 @@ def test_upload_persists_ocr_output_separately_from_manual_corrections(
         )
         assert original_version is not None
         assert original_version.corrected_fields_json == {}
+        assert any(
+            warning["field"] == "district" and warning["source"] == "ocr"
+            for warning in original_version.extracted_fields_json["field_warnings"]
+        )
+
+
+def test_missing_ocr_output_can_be_completed_manually(
+    ocr_context: tuple[sessionmaker[Session], AuthService],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, service = ocr_context
+    failed_result = DocumentOCRResult(
+        status="failed",
+        ocr_text="",
+        fields={},
+        field_confidence={},
+        warnings=("OCR output unavailable; enter the fields manually.",),
+        page_count=0,
+    )
+
+    def fake_process(content: bytes, filename: str, mime_type: str) -> DocumentOCRResult:
+        assert content and filename and mime_type
+        return failed_result
+
+    monkeypatch.setattr("modules.auth.process_document", fake_process)
+    token = service.login("ocr-owner@example.test", "synthetic-ocr-password")
+    uploaded = service.upload_landowner_document(
+        token,
+        "synthetic-no-ocr.pdf",
+        "application/pdf",
+        _pdf_with_pages("Synthetic land record"),
+    )
+
+    assert uploaded.ocr_result is not None
+    assert uploaded.ocr_result["status"] == "failed"
+    assert uploaded.ocr_result["ocr_text"] == ""
+    service.save_landowner_document_corrections(
+        token,
+        uploaded.id,
+        {
+            "owner_name": "Manually Entered Owner",
+            "district": "Sample District",
+            "village": "Sample Village",
+            "survey_or_plot_number": "SY-123",
+            "land_area": "2.5 acres",
+            "document_type": "sale deed",
+        },
+    )
+
+    document = service.list_landowner_documents(token)[0]
+    assert document.ocr_result is not None
+    assert document.ocr_result["status"] == "failed"
+    assert document.corrected_fields_json["owner_name"] == "Manually Entered Owner"
 
 
 def test_approved_application_fields_cannot_be_edited(

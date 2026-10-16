@@ -110,9 +110,6 @@ def extract_fields(lines: Sequence[OCRLine]) -> FieldExtraction:
         area_match = _AREA_PATTERN.search(fields["land_area"] or "")
         if area_match:
             fields["land_area"] = area_match.group(0)
-        else:
-            fields["land_area"] = None
-            confidence["land_area"] = None
 
     if fields["registration_or_document_number"] is not None:
         number_match = _REGISTRATION_NUMBER_PATTERN.search(
@@ -120,17 +117,11 @@ def extract_fields(lines: Sequence[OCRLine]) -> FieldExtraction:
         )
         if number_match:
             fields["registration_or_document_number"] = number_match.group(0)
-        else:
-            fields["registration_or_document_number"] = None
-            confidence["registration_or_document_number"] = None
 
     if fields["document_date"] is not None:
         date_match = _DATE_PATTERN.search(fields["document_date"] or "")
         if date_match:
             fields["document_date"] = date_match.group(0)
-        else:
-            fields["document_date"] = None
-            confidence["document_date"] = None
 
     combined_text = "\n".join(line.text for line in lines)
     for document_type, pattern in _DOCUMENT_TYPES:

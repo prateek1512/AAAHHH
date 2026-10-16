@@ -9,7 +9,6 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from modules.auth import (
     ApplicationReviewDetail,
-    ApprovedRegistryRecord,
     AuditEventSummary,
     AuthorizationError,
     AuthService,
@@ -20,6 +19,8 @@ from modules.auth_ui import get_auth_service, render_login
 from modules.document_storage import DocumentStorageError
 from modules.ocr import render_document_preview
 from modules.field_validation import FIELD_LABELS
+from modules.parcel_map import render_parcel_map
+from modules.registry_ui import render_approved_registry
 
 st.set_page_config(
     page_title="Government Officer Portal",
@@ -317,13 +318,23 @@ def _application_review() -> None:
 
     st.divider()
 
-    tab1, tab2, tab3, tab4 = st.tabs(
-        ["OCR & warnings", "Owner fields", "Original documents", "Review history"]
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+        [
+            "OCR & warnings",
+            "Owner fields",
+            "Original documents",
+            "Review history",
+            "Consistency indicator",
+            "Discrepancy checks",
+            "Parcel map",
+        ]
     )
 
     with tab1:
         st.write(f"**OCR processing status:** {detail.ocr_status.capitalize()}")
         extracted_fields = detail.extracted_fields_json.get("fields")
+        raw_confidence = detail.extracted_fields_json.get("field_confidence")
+        field_confidence = raw_confidence if isinstance(raw_confidence, dict) else {}
         if isinstance(extracted_fields, dict) and extracted_fields:
             for field_name, value in extracted_fields.items():
                 label = (
@@ -331,11 +342,56 @@ def _application_review() -> None:
                     if isinstance(field_name, str)
                     else str(field_name)
                 )
-                st.write(f"**{label}:** {value if value is not None else 'Not extracted'}")
+                confidence = field_confidence.get(field_name)
+                confidence_text = (
+                    f" · OCR engine confidence {confidence}%"
+                    if isinstance(confidence, (int, float))
+                    else ""
+                )
+                st.write(
+                    f"**{label}:** {value if value is not None else 'Not extracted'}"
+                    f"{confidence_text}"
+                )
         else:
             st.warning(
                 "OCR fields are missing or unreadable. Use the original document to "
                 "understand the submitted values."
+            )
+        with st.expander("Compare OCR results with landowner corrections"):
+            extracted = extracted_fields if isinstance(extracted_fields, dict) else {}
+            warning_values = detail.extracted_fields_json.get("field_warnings", [])
+            warnings_by_field: dict[str, list[str]] = {}
+            if isinstance(warning_values, list):
+                for warning in warning_values:
+                    if not isinstance(warning, dict):
+                        continue
+                    field_name = warning.get("field")
+                    message = warning.get("message")
+                    if isinstance(field_name, str) and isinstance(message, str):
+                        warnings_by_field.setdefault(field_name, []).append(message)
+            comparison_rows = []
+            for field_name, label in FIELD_LABELS.items():
+                confidence = field_confidence.get(field_name)
+                comparison_rows.append(
+                    {
+                        "Field": label,
+                        "OCR result": extracted.get(field_name) or "Not extracted",
+                        "OCR engine confidence": (
+                            f"{confidence}%"
+                            if isinstance(confidence, (int, float))
+                            else "Not provided"
+                        ),
+                        "Landowner-corrected value": (
+                            detail.corrected_fields_json.get(field_name) or "Not provided"
+                        ),
+                        "Review warnings": " ".join(warnings_by_field.get(field_name, []))
+                        or "None",
+                    }
+                )
+            st.dataframe(comparison_rows, hide_index=True, use_container_width=True)
+            st.caption(
+                "OCR confidence estimates text recognition only; it does not establish "
+                "whether the extracted or corrected field is factually or legally correct."
             )
         ocr_text = detail.extracted_fields_json.get("ocr_text")
         if isinstance(ocr_text, str) and ocr_text.strip():
@@ -422,6 +478,107 @@ def _application_review() -> None:
         else:
             st.info("No review events yet.")
 
+    with tab5:
+        indicator = detail.consistency_score
+        st.subheader("Preliminary consistency indicator")
+        score = indicator.get("score")
+        if isinstance(score, (int, float)):
+            st.metric("Preliminary consistency indicator", f"{score:.1f} / 100")
+        else:
+            st.info("Indicator unavailable because no scoring components are available.")
+        st.warning(indicator.get("warning", "For manual-review prioritization only."))
+        st.caption(indicator.get("formula", ""))
+        components = indicator.get("components", {})
+        if isinstance(components, dict):
+            component_labels = {
+                "ocr_confidence": "OCR engine confidence",
+                "required_completeness": "Required-field completeness",
+                "reference_consistency": "Reference consistency",
+                "audit_integrity": "Required audit events and chain integrity",
+            }
+            for component_name, component in components.items():
+                if not isinstance(component, dict):
+                    continue
+                component_score = component.get("score")
+                shown_score = (
+                    f"{component_score:.1f} / 100"
+                    if isinstance(component_score, (int, float))
+                    else "Unavailable"
+                )
+                effective_weight = component.get("effective_weight_percent")
+                weight_text = (
+                    f" · Effective weight {effective_weight:g}%"
+                    if isinstance(effective_weight, (int, float))
+                    else ""
+                )
+                with st.expander(
+                    f"{component_labels.get(component_name, component_name)}: "
+                    f"{shown_score}{weight_text}"
+                ):
+                    st.write(component.get("explanation", ""))
+                    affected = component.get("warnings_affecting_result", [])
+                    if affected:
+                        st.markdown("Warnings affecting this component:")
+                        for warning in affected:
+                            st.write(
+                                f"**{warning.get('code', 'warning')} · "
+                                f"{', '.join(warning.get('fields_compared', []))}**"
+                            )
+                            st.caption(warning.get("explanation", ""))
+                            values = warning.get("compared_values", {})
+                            if isinstance(values, dict):
+                                for field_name, value in values.items():
+                                    st.caption(f"{field_name}: {value}")
+                    else:
+                        st.caption("No warning affected this component.")
+        st.caption(
+            "A higher value only summarizes consistency in the checks that were "
+            "available. Missing inputs are excluded and are not treated as passed."
+        )
+
+    with tab6:
+        if detail.discrepancy_warnings:
+            for warning in detail.discrepancy_warnings:
+                severity = warning.get("severity")
+                title = (
+                    "Definite format or required-field issue"
+                    if severity == "definite"
+                    else "Possible discrepancy"
+                    if severity == "possible"
+                    else "Comparison unavailable"
+                )
+                fields_compared = warning.get("fields_compared", [])
+                st.markdown(f"**{title} · {', '.join(fields_compared)}**")
+                st.write(warning.get("rule", ""))
+                compared_values = warning.get("compared_values", {})
+                if isinstance(compared_values, dict):
+                    for field, value in compared_values.items():
+                        st.caption(f"{field}: {value}")
+                st.divider()
+        else:
+            st.success("No discrepancies were identified by the available deterministic checks.")
+        st.caption(
+            "These checks identify values for human review. A mismatch is not proof of "
+            "fraud, ownership, or a legal defect; no decision is made automatically."
+        )
+
+    with tab7:
+        render_parcel_map(
+            detail.parcel_geojson,
+            record_identifier=detail.application_number,
+            identifier_label="Application number",
+            attributes={
+                "district": detail.corrected_fields_json.get("district"),
+                "village": detail.corrected_fields_json.get("village"),
+                "survey_or_plot_number": detail.corrected_fields_json.get(
+                    "survey_or_plot_number"
+                ),
+                "land_area": detail.corrected_fields_json.get("land_area"),
+            },
+            key=f"review_{detail.id}_{detail.current_version}",
+            validation_status=detail.parcel_geometry_validation_status,
+        )
+
     st.divider()
     if detail.status != "under_review":
         st.info("A decision is available only while the application is under review.")
@@ -431,7 +588,8 @@ def _application_review() -> None:
         st.subheader("Record a review decision")
         st.caption(
             "Decisions are final for this application state. Approval depends on validated "
-            "owner-reviewed fields and a supporting document, never OCR confidence alone."
+            "owner-reviewed fields and a supporting document, never OCR confidence or the "
+            "preliminary consistency indicator alone."
         )
         with st.form(f"decision_form_{detail.id}"):
             decision_label = st.selectbox(
@@ -499,51 +657,16 @@ def _application_review() -> None:
 
 
 def _approved_registry() -> None:
-    st.markdown('<div class="portal-eyebrow">Approved records</div>', unsafe_allow_html=True)
-    st.title("Approved Registry")
-    st.caption("Search and filter approved land records. Private documents and personal field data are not displayed.")
-
-    with st.expander("Search & Filters", expanded=True):
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            search = st.text_input("Search", placeholder="Record ID or application number...", key="registry_search")
-        with col2:
-            district = st.text_input("District", placeholder="Filter by district...", key="registry_district")
-        with col3:
-            village = st.text_input("Village", placeholder="Filter by village...", key="registry_village")
-
-    records = service.list_approved_registry(
-        token,
-        search=search if search else None,
-        district=district if district else None,
-        village=village if village else None,
-    )
-
-    st.divider()
-    if not records:
-        st.info("No approved records match the current filters.")
-        return
-
-    for record in records:
-        with st.container(border=True):
-            record_col, date_col = st.columns([2.5, 1])
-            with record_col:
-                st.markdown(f"**{record.public_record_id}**")
-                st.caption(f"Application: {record.application_number} · Applicant: {record.applicant_name}")
-                st.caption(f"Approved version {record.current_version}")
-            with date_col:
-                st.caption("Approved")
-                st.write(record.approved_at.strftime("%d %b %Y"))
-
-            if st.button("View details", key=f"registry_detail_{record.public_record_id}"):
-                # Could navigate to a detail view
-                st.toast("Detail view coming soon")
+    render_approved_registry(service, token, "officer")
 
 
 def _audit_explorer() -> None:
     st.markdown('<div class="portal-eyebrow">Audit log</div>', unsafe_allow_html=True)
     st.title("Audit Explorer")
-    st.caption("View the SHA-256 hash-linked audit trail for all important actions.")
+    st.caption(
+        "Inspect the append-only SHA-256 audit chain. Hash verification detects "
+        "inconsistencies but does not prove legal ownership or factual accuracy."
+    )
 
     with st.expander("Filters", expanded=True):
         col1, col2, col3 = st.columns(3)
@@ -553,6 +676,35 @@ def _audit_explorer() -> None:
             record_id_filter = st.text_input("Land Record ID", placeholder="Filter by land record...", key="audit_record_id")
         with col3:
             limit = st.number_input("Max results", min_value=10, max_value=500, value=100, step=10, key="audit_limit")
+
+    if st.button("Verify complete audit chain", type="primary"):
+        try:
+            st.session_state["audit_chain_verification"] = service.verify_audit_chain(token)
+        except AuthorizationError as error:
+            st.error(str(error))
+        except SQLAlchemyError:
+            logger.exception("Database error verifying audit chain")
+            st.error("The audit chain could not be verified because of a database error.")
+
+    verification = st.session_state.get("audit_chain_verification")
+    if verification is not None:
+        st.caption("Showing the last requested verification result; run a fresh check when needed.")
+        if verification.valid:
+            st.success(
+                f"Audit chain verified: all {verification.event_count} event(s) link "
+                "from the deterministic genesis and their hashes are consistent."
+            )
+        else:
+            st.error(
+                f"Audit chain verification failed for {verification.event_count} event(s)."
+            )
+            for issue in verification.errors:
+                st.write(f"- {issue}")
+        st.caption(
+            "Verification is tamper-evidence, not tamper-proof. A database administrator "
+            "could alter events and recompute the chain; verification does not validate "
+            "the truth of event data."
+        )
 
     try:
         app_id = int(app_id_filter) if app_id_filter else None
@@ -566,7 +718,20 @@ def _audit_explorer() -> None:
         record_id = None
         st.error("Invalid Land Record ID")
 
-    events = service.list_audit_events(token, application_id=app_id, land_record_id=record_id, limit=limit)
+    try:
+        events = service.list_audit_events(
+            token,
+            application_id=app_id,
+            land_record_id=record_id,
+            limit=limit,
+        )
+    except AuthorizationError as error:
+        st.error(str(error))
+        return
+    except SQLAlchemyError:
+        logger.exception("Database error loading audit events")
+        st.error("Audit events could not be loaded.")
+        return
 
     st.divider()
     if not events:
@@ -578,6 +743,7 @@ def _audit_explorer() -> None:
             col1, col2, col3 = st.columns([2, 2, 1])
             with col1:
                 st.markdown(f"**{event.event_type}**")
+                st.caption(f"Event ID: {event.id}")
                 st.caption(f"Actor: {event.actor_name} ({event.actor_email})")
             with col2:
                 if event.application_id:
@@ -594,10 +760,7 @@ def _audit_explorer() -> None:
             # Show hash chain info
             with st.expander("Hash chain details"):
                 st.code(f"Event hash: {event.event_hash}")
-                if event.previous_event_hash:
-                    st.code(f"Previous hash: {event.previous_event_hash}")
-                else:
-                    st.caption("Genesis event (no previous hash)")
+                st.code(f"Previous hash: {event.previous_event_hash}")
 
 
 if current_page == "Department Dashboard":

@@ -6,7 +6,7 @@ from io import BytesIO
 
 import pytest
 from PIL import Image
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from modules.auth import AuthService, AuthorizationError, hash_password
@@ -14,6 +14,7 @@ from modules.database import (
     Application,
     ApplicationVersion,
     AuditEvent,
+    ApprovedRecordVersion,
     Base,
     Database,
     Document,
@@ -200,6 +201,29 @@ def test_review_details_include_fields_warnings_version_and_private_document(
     assert detail.ocr_warnings == ("Confidence is a recognition estimate.",)
     assert detail.corrected_fields_json["district"] == "North District"
     assert detail.validation_warnings == ()
+    assert detail.consistency_score["label"] == "Preliminary consistency indicator"
+    assert detail.consistency_score["score"] is not None
+    assert "not a legal" in detail.consistency_score["warning"]
+    assert detail.consistency_score["components"]["audit_integrity"]["score"] == 0
+    assert detail.consistency_score["components"]["reference_consistency"]["score"] is None
+    duplicate_warning = next(
+        warning
+        for warning in detail.discrepancy_warnings
+        if warning["code"] == "possible_duplicate_application"
+    )
+    assert duplicate_warning["audience"] == "officer"
+    assert duplicate_warning["fields_compared"] == [
+        "survey_or_plot_number",
+        "district",
+        "village",
+    ]
+    landowner_detail = service.get_landowner_application(
+        tokens["owner"], ids["unassigned_application"]
+    )
+    assert not any(
+        warning["code"] == "possible_duplicate_application"
+        for warning in landowner_detail.discrepancy_warnings
+    )
     assert len(detail.documents) == 1
     assert "stored_path" not in detail.documents[0].__dataclass_fields__
     original = service.get_officer_application_document(
@@ -209,6 +233,38 @@ def test_review_details_include_fields_warnings_version_and_private_document(
     )
     assert original.original_filename == "synthetic-review.png"
     assert original.content.startswith(b"\x89PNG")
+
+
+def test_officer_review_details_include_optional_snapshot_geojson(
+    review_context: tuple[sessionmaker[Session], AuthService, dict[str, str], dict[str, int]],
+) -> None:
+    session_factory, service, tokens, ids = review_context
+    synthetic_geojson = {
+        "type": "Polygon",
+        "coordinates": [
+            [[-73.1, 40.1], [-73.0, 40.1], [-73.0, 40.2], [-73.1, 40.2], [-73.1, 40.1]]
+        ],
+    }
+    with transaction(session_factory) as session:
+        version = session.scalar(
+            select(ApplicationVersion).where(
+                ApplicationVersion.application_id == ids["unassigned_application"],
+                ApplicationVersion.version_number == 1,
+            )
+        )
+        assert version is not None
+        version.extracted_fields_json = {
+            **version.extracted_fields_json,
+            "parcel_geojson": synthetic_geojson,
+            "parcel_geometry_validation_status": "warning",
+        }
+
+    detail = service.get_application_for_review(
+        tokens["officer"], ids["unassigned_application"]
+    )
+    assert detail is not None
+    assert detail.parcel_geojson == synthetic_geojson
+    assert detail.parcel_geometry_validation_status == "warning"
 
 
 def test_private_review_access_is_role_and_assignment_scoped(
@@ -322,10 +378,22 @@ def test_officer_approval_creates_approved_record_and_side_effects(
         )
         assert record is not None
         assert record.current_version == application.current_version
+        assert record.current_version == 1
         assert record.approved_by == ids["officer"]
         assert record.approved_at.replace(tzinfo=result.decided_at.tzinfo) == result.decided_at
         assert record.approved_fields_json["owner_name"] == "Synthetic Owner"
         assert len(record.current_record_hash) == 64
+        version_snapshot = session.scalar(
+            select(ApprovedRecordVersion).where(
+                ApprovedRecordVersion.land_record_id == record.id,
+                ApprovedRecordVersion.version_number == 1,
+            )
+        )
+        assert version_snapshot is not None
+        assert version_snapshot.version_hash == record.current_record_hash
+        assert version_snapshot.authorized_by == ids["officer"]
+        assert version_snapshot.authorized_at.replace(tzinfo=timezone.utc) == result.decided_at
+        assert version_snapshot.audit_event.event_type == "approved_record_version_created"
         review_event = session.scalar(
             select(ReviewEvent).where(
                 ReviewEvent.application_id == application_id,
@@ -363,6 +431,484 @@ def test_officer_approval_creates_approved_record_and_side_effects(
     with pytest.raises(AuthorizationError, match="active review"):
         service.decide_officer_application(tokens["officer"], application_id, "approve")
     assert len(service.list_approved_registry(tokens["officer"])) == 1
+
+
+def test_public_record_qr_is_available_only_after_approval(
+    review_context: tuple[sessionmaker[Session], AuthService, dict[str, str], dict[str, int]],
+) -> None:
+    session_factory, service, tokens, ids = review_context
+    assert service.get_public_approved_record_qr("LR-2026-UNASSIGNED") is None
+    assert service.get_public_approved_record_qr("LR-2026-DRAFT") is None
+    with transaction(session_factory) as session:
+        rejected = session.get(Application, ids["no_document_application"])
+        assert rejected is not None
+        rejected.status = "rejected"
+    assert service.get_public_approved_record_qr("LR-2026-NODOC") is None
+
+    approval = service.decide_officer_application(
+        tokens["officer"], ids["assigned_application"], "approve"
+    )
+    assert approval.public_record_id is not None
+    qr = service.get_public_approved_record_qr(approval.public_record_id)
+
+    assert qr is not None
+    assert qr.public_record_id == approval.public_record_id
+    assert f"record_id={approval.public_record_id}" in qr.verification_url
+    assert "application_id" not in qr.verification_url
+    assert qr.png_bytes.startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def test_public_approved_record_exposes_optional_geojson_to_map_only(
+    review_context: tuple[sessionmaker[Session], AuthService, dict[str, str], dict[str, int]],
+) -> None:
+    session_factory, service, tokens, ids = review_context
+    approval = service.decide_officer_application(
+        tokens["officer"], ids["assigned_application"], "approve"
+    )
+    assert approval.public_record_id is not None
+    synthetic_geojson = {
+        "type": "Feature",
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [
+                [
+                    [-73.1, 40.1],
+                    [-73.0, 40.1],
+                    [-73.0, 40.2],
+                    [-73.1, 40.2],
+                    [-73.1, 40.1],
+                ]
+            ],
+        },
+        "properties": {"private_note": "must not reach map"},
+    }
+    with transaction(session_factory) as session:
+        record = session.scalar(
+            select(LandRecord).where(
+                LandRecord.public_record_id == approval.public_record_id
+            )
+        )
+        assert record is not None
+        session.connection().execute(
+            update(LandRecord)
+            .where(LandRecord.id == record.id)
+            .values(
+                approved_fields_json={
+                    **record.approved_fields_json,
+                    "parcel_geojson": synthetic_geojson,
+                    "parcel_geometry_validation_status": "verified",
+                    "private_contact": "private@example.test",
+                }
+            )
+        )
+
+    public_record = service.get_public_approved_record(approval.public_record_id)
+    assert public_record is not None
+    assert public_record.parcel_geojson == synthetic_geojson
+    assert public_record.parcel_geometry_validation_status == "verified"
+    assert "private_contact" not in public_record.approved_fields
+
+
+def test_shared_registry_includes_only_workflow_approved_public_fields(
+    review_context: tuple[sessionmaker[Session], AuthService, dict[str, str], dict[str, int]],
+) -> None:
+    session_factory, service, tokens, ids = review_context
+    approval = service.decide_officer_application(
+        tokens["officer"],
+        ids["assigned_application"],
+        "approve",
+    )
+    assert approval.public_record_id is not None
+
+    with transaction(session_factory) as session:
+        approved_record = session.scalar(
+            select(LandRecord).where(
+                LandRecord.public_record_id == approval.public_record_id
+            )
+        )
+        assert approved_record is not None
+        session.connection().execute(
+            update(LandRecord)
+            .where(LandRecord.id == approved_record.id)
+            .values(
+                approved_fields_json={
+                    **approved_record.approved_fields_json,
+                    "registration_or_document_number": "PRIVATE-DEED-123",
+                    "document_date": "01/02/2020",
+                    "personal_identification_number": "SYNTHETIC-PIN",
+                    "private_contact_details": "private@example.test",
+                    "internal_officer_notes": "Synthetic private note",
+                }
+            )
+        )
+        pending_application = session.get(Application, ids["unassigned_application"])
+        rejected_application = session.get(Application, ids["draft_application"])
+        officer = session.get(User, ids["officer"])
+        assert pending_application is not None
+        assert rejected_application is not None
+        assert officer is not None
+        rejected_application.status = "rejected"
+        unverified_application = Application(
+            application_number="SYNTHETIC-NO-APPROVAL-AUDIT",
+            applicant_id=pending_application.applicant_id,
+            status="approved",
+            current_version=1,
+        )
+        session.add(unverified_application)
+        session.flush()
+        session.add_all(
+            [
+                LandRecord(
+                    application=pending_application,
+                    public_record_id="SYNTHETIC-PENDING",
+                    current_version=1,
+                    approved_fields_json={
+                        "district": "North District",
+                        "village": "Cedar Village",
+                        "survey_or_plot_number": "SY-123",
+                        "land_area": "2 acres",
+                    },
+                    current_record_hash="a" * 64,
+                    approved_by=officer.id,
+                    is_public=True,
+                ),
+                LandRecord(
+                    application=rejected_application,
+                    public_record_id="SYNTHETIC-REJECTED",
+                    current_version=1,
+                    approved_fields_json={
+                        "district": "North District",
+                        "village": "Cedar Village",
+                        "survey_or_plot_number": "SY-123",
+                        "land_area": "2 acres",
+                    },
+                    current_record_hash="b" * 64,
+                    approved_by=officer.id,
+                    is_public=True,
+                ),
+                LandRecord(
+                    application=unverified_application,
+                    public_record_id="SYNTHETIC-NO-APPROVAL-AUDIT",
+                    current_version=1,
+                    approved_fields_json={
+                        "district": "North District",
+                        "village": "Cedar Village",
+                        "survey_or_plot_number": "SY-123",
+                        "land_area": "2 acres",
+                    },
+                    current_record_hash="c" * 64,
+                    approved_by=officer.id,
+                    is_public=True,
+                ),
+            ]
+        )
+
+    officer_records = service.list_approved_registry(tokens["officer"])
+    landowner_records = service.list_approved_registry(tokens["owner"])
+    assert officer_records == landowner_records
+    assert [record.public_record_id for record in officer_records] == [
+        approval.public_record_id
+    ]
+    public_record = officer_records[0]
+    assert public_record.district == "South District"
+    assert public_record.village == "Pine Village"
+    assert public_record.survey_or_plot_number == "SY-123"
+    assert public_record.land_area == "2 acres"
+    assert not hasattr(public_record, "applicant_name")
+    assert not hasattr(public_record, "approved_fields_json")
+    assert not hasattr(public_record, "application_number")
+    assert "PRIVATE-DEED-123" not in repr(public_record)
+    assert "SYNTHETIC-PIN" not in repr(public_record)
+    assert "private@example.test" not in repr(public_record)
+    assert "Synthetic private note" not in repr(public_record)
+
+    with pytest.raises(AuthorizationError):
+        service.get_officer_registry_internal_details(
+            tokens["owner"], approval.public_record_id
+        )
+
+
+def test_shared_registry_search_filters_detail_and_audit_history(
+    review_context: tuple[sessionmaker[Session], AuthService, dict[str, str], dict[str, int]],
+) -> None:
+    session_factory, service, tokens, ids = review_context
+    approval = service.decide_officer_application(
+        tokens["officer"],
+        ids["assigned_application"],
+        "approve",
+    )
+    assert approval.public_record_id is not None
+
+    by_public_id = service.list_approved_registry(
+        tokens["owner"], search=approval.public_record_id.lower()
+    )
+    by_survey_number = service.list_approved_registry(tokens["owner"], search="sy-123")
+    by_district_and_village = service.list_approved_registry(
+        tokens["officer"],
+        district="south district",
+        village="PINE VILLAGE",
+    )
+    assert len(by_public_id) == len(by_survey_number) == len(by_district_and_village) == 1
+    assert by_public_id[0].public_record_id == approval.public_record_id
+    assert by_survey_number[0].public_record_id == approval.public_record_id
+    assert by_district_and_village[0].public_record_id == approval.public_record_id
+
+    detail = service.get_approved_registry_record(
+        tokens["owner"], approval.public_record_id
+    )
+    assert detail is not None
+    assert detail.record.current_version == 1
+    assert detail.record.approved_at.replace(tzinfo=approval.decided_at.tzinfo) == approval.decided_at
+    assert detail.audit_verified is True
+    assert [event.event_type for event in detail.history] == [
+        "application_approve",
+        "approved_record_version_created",
+    ]
+    internal = service.get_officer_registry_internal_details(
+        tokens["officer"], approval.public_record_id
+    )
+    assert internal is not None
+    assert internal.applicant_name == "Synthetic Owner"
+    assert internal.approved_fields_json["owner_name"] == "Synthetic Owner"
+    with session_factory() as session:
+        audit_events = session.scalars(
+            select(AuditEvent).where(AuditEvent.application_id == ids["assigned_application"])
+        ).all()
+        assert len(audit_events) == 2
+        assert all("approved_record_hash" in item.event_data_json for item in audit_events)
+    verification = service.verify_audit_chain(tokens["officer"])
+    assert verification.valid is True
+    assert verification.event_count == 2
+
+
+def test_approved_record_correction_creates_new_version_and_preserves_previous_snapshot(
+    review_context: tuple[sessionmaker[Session], AuthService, dict[str, str], dict[str, int]],
+) -> None:
+    session_factory, service, tokens, ids = review_context
+    approval = service.decide_officer_application(
+        tokens["officer"], ids["assigned_application"], "approve"
+    )
+    assert approval.public_record_id is not None
+    before = service.list_approved_record_versions(
+        tokens["owner"], approval.public_record_id
+    )
+    before_internal = service.list_approved_record_versions(
+        tokens["officer"], approval.public_record_id
+    )
+    assert len(before) == 1
+    assert len(before_internal) == 1
+    original_version = before[0]
+    original_snapshot = dict(before_internal[0].approved_fields)
+
+    with pytest.raises(AuthorizationError):
+        service.correct_approved_record(
+            tokens["owner"],
+            approval.public_record_id,
+            {"survey_or_plot_number": "SY-999"},
+            "Authorized correction reason",
+        )
+    with pytest.raises(ValueError, match="at least 10 characters"):
+        service.correct_approved_record(
+            tokens["officer"],
+            approval.public_record_id,
+            {"survey_or_plot_number": "SY-999"},
+            "typo",
+        )
+
+    correction = service.correct_approved_record(
+        tokens["officer"],
+        approval.public_record_id,
+        {"survey_or_plot_number": "SY-999"},
+        "Correct survey number against official register.",
+    )
+    assert correction.version_number == 2
+    assert len(correction.version_hash) == 64
+
+    after = service.list_approved_record_versions(
+        tokens["owner"], approval.public_record_id
+    )
+    after_internal = service.list_approved_record_versions(
+        tokens["officer"], approval.public_record_id
+    )
+    assert [version.version_number for version in after] == [1, 2]
+    assert after_internal[0].approved_fields == original_snapshot
+    assert after[0].version_hash == original_version.version_hash
+    assert after[0].audit_event_id == original_version.audit_event_id
+    assert after[1].approved_fields["survey_or_plot_number"] == "SY-999"
+    assert after[1].version_hash == correction.version_hash
+    assert after[1].audit_event_id == correction.audit_event_id
+
+    current_record = service.list_approved_registry(tokens["owner"])[0]
+    assert current_record.current_version == 2
+    assert current_record.survey_or_plot_number == "SY-999"
+
+    with session_factory() as session:
+        version_one = session.scalar(
+            select(ApprovedRecordVersion).where(
+                ApprovedRecordVersion.version_number == 1,
+            )
+        )
+        assert version_one is not None
+        assert version_one.approved_fields_json == original_snapshot
+        assert version_one.version_hash == original_version.version_hash
+        assert version_one.audit_event.event_type == "approved_record_version_created"
+        correction_event = session.get(AuditEvent, correction.audit_event_id)
+        assert correction_event is not None
+        assert correction_event.event_type == "approved_record_version_created"
+        authorization_event = session.scalar(
+            select(AuditEvent).where(
+                AuditEvent.event_type == "approved_record_correction_authorized"
+            )
+        )
+        assert authorization_event is not None
+        assert authorization_event.event_data_json["changed_fields"] == [
+            "survey_or_plot_number"
+        ]
+        assert authorization_event.event_data_json["approved_record_hash"] == correction.version_hash
+
+    with pytest.raises(ValueError, match="immutable"):
+        with transaction(session_factory) as session:
+            version_one = session.scalar(
+                select(ApprovedRecordVersion).where(
+                    ApprovedRecordVersion.version_number == 1
+                )
+            )
+            assert version_one is not None
+            version_one.approved_fields_json = {"survey_or_plot_number": "OVERWRITTEN"}
+
+    assert service.verify_audit_chain(tokens["officer"]).valid is True
+
+
+def test_public_record_verification_is_anonymous_and_only_returns_public_fields(
+    review_context: tuple[sessionmaker[Session], AuthService, dict[str, str], dict[str, int]],
+) -> None:
+    _, service, tokens, ids = review_context
+    approval = service.decide_officer_application(
+        tokens["officer"], ids["assigned_application"], "approve"
+    )
+    assert approval.public_record_id is not None
+
+    public_record = service.get_public_approved_record(approval.public_record_id)
+    assert public_record is not None
+    assert public_record.current_version == 1
+    assert len(public_record.current_version_hash) == 64
+    assert set(public_record.approved_fields) == {
+        "district",
+        "village",
+        "survey_or_plot_number",
+        "land_area",
+    }
+    assert len(public_record.versions) == 1
+    version = public_record.versions[0]
+    assert version.version_number == 1
+    assert set(version.approved_fields) == set(public_record.approved_fields)
+    assert version.version_hash == public_record.current_version_hash
+    assert not hasattr(public_record, "applicant_name")
+    assert not hasattr(public_record, "application_number")
+    assert not hasattr(version, "authorizer_name")
+    assert not hasattr(version, "audit_event_id")
+
+    result = service.verify_public_record_audit_integrity(approval.public_record_id)
+    assert result is not None
+    assert result.passed is True
+    assert result.audit_chain_passed is True
+    assert result.record_versions_passed is True
+
+    assert service.get_public_approved_record("UNKNOWN-PUBLIC-ID") is None
+    assert service.verify_public_record_audit_integrity("UNKNOWN-PUBLIC-ID") is None
+
+
+def test_public_record_verification_warns_when_audit_event_is_modified(
+    review_context: tuple[sessionmaker[Session], AuthService, dict[str, str], dict[str, int]],
+) -> None:
+    session_factory, service, tokens, ids = review_context
+    approval = service.decide_officer_application(
+        tokens["officer"], ids["assigned_application"], "approve"
+    )
+    assert approval.public_record_id is not None
+    before = service.verify_public_record_audit_integrity(approval.public_record_id)
+    assert before is not None and before.passed is True
+
+    with transaction(session_factory) as session:
+        event = session.scalar(
+            select(AuditEvent).where(
+                AuditEvent.event_type == "approved_record_version_created"
+            )
+        )
+        assert event is not None
+        session.connection().execute(
+            update(AuditEvent)
+            .where(AuditEvent.id == event.id)
+            .values(
+                event_data_json={
+                    **event.event_data_json,
+                    "approved_record_hash": "0" * 64,
+                }
+            )
+        )
+
+    result = service.verify_public_record_audit_integrity(approval.public_record_id)
+    assert result is not None
+    assert result.passed is False
+    assert result.audit_chain_passed is False
+    assert any("hash mismatch" in error.lower() for error in result.errors)
+
+
+def test_public_record_integrity_detects_a_modified_version_snapshot(
+    review_context: tuple[sessionmaker[Session], AuthService, dict[str, str], dict[str, int]],
+) -> None:
+    session_factory, service, tokens, ids = review_context
+    approval = service.decide_officer_application(
+        tokens["officer"], ids["assigned_application"], "approve"
+    )
+    assert approval.public_record_id is not None
+
+    with transaction(session_factory) as session:
+        version = session.scalar(select(ApprovedRecordVersion))
+        assert version is not None
+        session.connection().execute(
+            update(ApprovedRecordVersion)
+            .where(ApprovedRecordVersion.id == version.id)
+            .values(
+                approved_fields_json={
+                    **version.approved_fields_json,
+                    "district": "Modified District",
+                }
+            )
+        )
+
+    result = service.verify_public_record_audit_integrity(approval.public_record_id)
+    assert result is not None
+    assert result.passed is False
+    assert result.audit_chain_passed is True
+    assert result.record_versions_passed is False
+    assert any("version 1 hash mismatch" in error.lower() for error in result.errors)
+
+
+def test_persisted_chain_head_detects_removed_final_event(
+    review_context: tuple[sessionmaker[Session], AuthService, dict[str, str], dict[str, int]],
+) -> None:
+    session_factory, service, tokens, ids = review_context
+    approval = service.decide_officer_application(
+        tokens["officer"], ids["assigned_application"], "approve"
+    )
+    assert approval.public_record_id is not None
+    review_started = service.start_officer_application_review(
+        tokens["officer"], ids["unassigned_application"]
+    )
+    assert service.verify_audit_chain(tokens["officer"]).valid is True
+
+    with transaction(session_factory) as session:
+        session.execute(
+            delete(AuditEvent).where(
+                AuditEvent.event_type == "application_review_started",
+                AuditEvent.application_id == review_started.id,
+            )
+        )
+
+    verification = service.verify_audit_chain(tokens["officer"])
+    assert verification.valid is False
+    assert any("stored audit chain head" in error.lower() for error in verification.errors)
 
 
 @pytest.mark.parametrize(
@@ -522,3 +1068,85 @@ def test_landowner_cannot_approve_even_by_calling_decision_service(
                 ReviewEvent.application_id == ids["assigned_application"]
             )
         ) == 0
+
+
+def test_approval_database_error_rolls_back_decision_and_record(
+    review_context: tuple[sessionmaker[Session], AuthService, dict[str, str], dict[str, int]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_factory, service, tokens, ids = review_context
+
+    def fail_audit_write(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("injected audit persistence failure")
+
+    monkeypatch.setattr("modules.database.append_audit_event", fail_audit_write)
+    with pytest.raises(RuntimeError, match="injected audit persistence failure"):
+        service.decide_officer_application(
+            tokens["officer"],
+            ids["assigned_application"],
+            "approve",
+        )
+
+    with session_factory() as session:
+        application = session.get(Application, ids["assigned_application"])
+        assert application is not None
+        assert application.status == "under_review"
+        assert application.land_record is None
+        assert session.scalar(
+            select(func.count()).select_from(ReviewEvent).where(
+                ReviewEvent.application_id == ids["assigned_application"]
+            )
+        ) == 0
+        assert session.scalar(
+            select(func.count()).select_from(AuditEvent).where(
+                AuditEvent.application_id == ids["assigned_application"]
+            )
+        ) == 0
+        assert session.scalar(
+            select(func.count()).select_from(Notification).where(
+                Notification.application_id == ids["assigned_application"]
+            )
+        ) == 0
+
+
+def test_stale_decision_cannot_overwrite_first_review_decision(
+    review_context: tuple[sessionmaker[Session], AuthService, dict[str, str], dict[str, int]],
+) -> None:
+    session_factory, service, tokens, ids = review_context
+    application_id = ids["assigned_application"]
+
+    first_decision = service.decide_officer_application(
+        tokens["officer"],
+        application_id,
+        "request_corrections",
+        "Please provide a corrected survey number.",
+    )
+    assert first_decision.status == "corrections_requested"
+
+    with pytest.raises(AuthorizationError, match="no longer assigned"):
+        service.decide_officer_application(
+            tokens["officer"],
+            application_id,
+            "reject",
+            "The submitted survey number does not match.",
+        )
+
+    with session_factory() as session:
+        application = session.get(Application, application_id)
+        assert application is not None
+        assert application.status == "corrections_requested"
+        assert session.scalar(
+            select(func.count()).select_from(ReviewEvent).where(
+                ReviewEvent.application_id == application_id
+            )
+        ) == 1
+        assert session.scalar(
+            select(func.count()).select_from(AuditEvent).where(
+                AuditEvent.application_id == application_id
+            )
+        ) == 1
+        assert session.scalar(
+            select(func.count()).select_from(Notification).where(
+                Notification.application_id == application_id
+            )
+        ) == 1

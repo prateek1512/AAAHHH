@@ -14,10 +14,16 @@ from uuid import uuid4
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 
+from modules.audit import AuditVerificationResult, GENESIS_HASH
+from modules.consistency_score import calculate_consistency_score
 from modules.database import (
     ApplicationData,
     ApplicationDecisionData,
     ApplicationSubmissionData,
+    ApprovedRecordVersionChangeData,
+    ApprovedRecordVersionData,
+    ApprovedRegistryHistoryData,
+    ApprovedRegistryRecordData,
     AuthUserData,
     Database,
     DemoAccountRoleConflict,
@@ -26,12 +32,15 @@ from modules.database import (
     LandRecordSummaryData,
     LandownerApplicationDetailData,
     NotificationData,
+    OfficerRegistryInternalDetailsData,
     create_database,
     initialize_database,
 )
 from modules.document_storage import DocumentStorage
+from modules.discrepancy import detect_discrepancies
 from modules.field_validation import FIELD_LABELS, validate_corrected_fields
 from modules.ocr import process_document
+from modules.public_qr import PublicRecordQRCode, generate_public_record_qr
 
 Role = Literal["landowner", "officer"]
 ReviewPolicy = Literal["assigned_only", "assigned_or_unassigned"]
@@ -98,6 +107,7 @@ class LandownerApplicationDetail:
     document_ids: tuple[int, ...]
     review_events: tuple[LandownerReviewEvent, ...]
     public_record_id: str | None
+    discrepancy_warnings: tuple[dict[str, object], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,8 +222,12 @@ class ApplicationReviewDetail:
     ocr_status: str
     ocr_warnings: tuple[str, ...]
     validation_warnings: tuple[str, ...]
+    discrepancy_warnings: tuple[dict[str, object], ...]
+    consistency_score: dict[str, object]
     documents: tuple[OfficerReviewDocument, ...]
     review_events: tuple[OfficerReviewEvent, ...]
+    parcel_geojson: object | None = None
+    parcel_geometry_validation_status: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -260,13 +274,92 @@ class ApplicationDecision:
 @dataclass(frozen=True, slots=True)
 class ApprovedRegistryRecord:
     public_record_id: str
-    application_number: str
-    applicant_name: str
     approved_at: datetime
     current_version: int
-    approved_fields_json: dict[str, object]
     district: str | None
     village: str | None
+    survey_or_plot_number: str | None
+    land_area: str | None
+    parcel_geojson: object | None = None
+    parcel_geometry_validation_status: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovedRegistryHistoryEvent:
+    event_type: str
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovedRegistryDetail:
+    record: ApprovedRegistryRecord
+    history: tuple[ApprovedRegistryHistoryEvent, ...]
+    audit_verified: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovedRecordVersion:
+    version_number: int
+    approved_fields: dict[str, object]
+    version_hash: str
+    authorized_by: int
+    authorizer_name: str
+    authorized_at: datetime
+    audit_event_id: int
+    audit_event_type: str
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovedRecordVersionChange:
+    public_record_id: str
+    version_number: int
+    version_hash: str
+    authorized_at: datetime
+    audit_event_id: int
+
+
+@dataclass(frozen=True, slots=True)
+class PublicRecordVersion:
+    version_number: int
+    approved_fields: dict[str, object]
+    version_hash: str
+    authorized_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class PublicApprovedRecord:
+    public_record_id: str
+    current_version: int
+    current_version_hash: str
+    approved_fields: dict[str, object]
+    versions: tuple[PublicRecordVersion, ...]
+    parcel_geojson: object | None = None
+    parcel_geometry_validation_status: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PublicRecordQRData:
+    public_record_id: str
+    verification_url: str
+    png_bytes: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class PublicAuditIntegrityResult:
+    passed: bool
+    audit_chain_passed: bool
+    record_versions_passed: bool
+    event_count: int
+    errors: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class OfficerRegistryInternalDetails:
+    application_number: str
+    applicant_name: str
+    approved_fields_json: dict[str, object]
+    approver_name: str
+    review_notes: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,6 +374,15 @@ class AuditEventSummary:
     previous_event_hash: str | None
     integrity_verified: bool
     created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class AuditChainVerification:
+    valid: bool
+    event_count: int
+    genesis_hash: str
+    head_hash: str | None
+    errors: tuple[str, ...]
 
 
 def hash_password(password: str) -> str:
@@ -330,6 +432,7 @@ def _application_summary(application: ApplicationData) -> ApplicationSummary:
 
 def _landowner_application_detail(
     application: LandownerApplicationDetailData,
+    discrepancy_warnings: tuple[dict[str, object], ...],
 ) -> LandownerApplicationDetail:
     submitted_at = application.submitted_at
     if submitted_at is not None:
@@ -368,6 +471,7 @@ def _landowner_application_detail(
             for event in application.review_events
         ),
         public_record_id=application.public_record_id,
+        discrepancy_warnings=discrepancy_warnings,
     )
 
 
@@ -404,6 +508,26 @@ def _land_record_summary(record: LandRecordSummaryData) -> LandRecordSummary:
         public_record_id=record.public_record_id,
         approved_at=record.approved_at,
         current_version=record.current_version,
+    )
+
+
+def _utc_datetime(value: datetime) -> datetime:
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
+def _approved_registry_record(
+    record: ApprovedRegistryRecordData,
+) -> ApprovedRegistryRecord:
+    return ApprovedRegistryRecord(
+        public_record_id=record.public_record_id,
+        approved_at=_utc_datetime(record.approved_at),
+        current_version=record.current_version,
+        district=record.district,
+        village=record.village,
+        survey_or_plot_number=record.survey_or_plot_number,
+        land_area=record.land_area,
+        parcel_geojson=record.parcel_geojson,
+        parcel_geometry_validation_status=record.parcel_geometry_validation_status,
     )
 
 
@@ -513,7 +637,22 @@ class AuthService:
         )
         if application is None:
             raise AuthorizationError("You are not authorized to access this application.")
-        return _landowner_application_detail(application)
+        context = self._database.get_application_discrepancy_context(application_id)
+        discrepancy_warnings = detect_discrepancies(
+            corrected_fields=application.corrected_fields_json,
+            extracted_fields=context["extracted_fields"],
+            previous_fields=context["previous_fields"],
+            other_applications=context["other_applications"],
+            approved_records=context["approved_records"],
+        )
+        return _landowner_application_detail(
+            application,
+            tuple(
+                warning
+                for warning in discrepancy_warnings
+                if warning.get("audience") != "officer"
+            ),
+        )
 
     @property
     def max_upload_size_mb(self) -> int:
@@ -526,6 +665,8 @@ class AuthService:
         original_filename: str,
         mime_type: str,
         content: bytes,
+        *,
+        application_number: str | None = None,
     ) -> LandownerDocumentSummary:
         """Store an original document and create its owner-scoped draft application."""
         principal = self.require_role(token, "landowner")
@@ -533,7 +674,10 @@ class AuthService:
         try:
             document = self._database.create_landowner_application_document(
                 user_id=principal.user_id,
-                application_number=f"LR-{datetime.now(UTC):%Y}-{uuid4().hex[:8].upper()}",
+                application_number=(
+                    application_number
+                    or f"LR-{datetime.now(UTC):%Y}-{uuid4().hex[:8].upper()}"
+                ),
                 original_filename=stored_document.original_filename,
                 stored_path=stored_document.stored_path,
                 document_sha256=stored_document.document_sha256,
@@ -833,6 +977,51 @@ class AuthService:
         review_events = data["review_events"]
         extracted_fields = version.extracted_fields_json if version else {}
         corrected_fields = version.corrected_fields_json if version else {}
+        discrepancy_context = self._database.get_application_discrepancy_context(
+            application_id
+        )
+        discrepancy_warnings = detect_discrepancies(
+            corrected_fields=corrected_fields,
+            extracted_fields=discrepancy_context["extracted_fields"],
+            previous_fields=discrepancy_context["previous_fields"],
+            other_applications=discrepancy_context["other_applications"],
+            approved_records=discrepancy_context["approved_records"],
+        )
+        confidence = extracted_fields.get("field_confidence", {})
+        confidence_values = confidence if isinstance(confidence, Mapping) else {}
+        field_warnings = extracted_fields.get("field_warnings", [])
+        if not isinstance(field_warnings, list):
+            field_warnings = []
+        required_audit_events_present = any(
+            event_type in {"application_submitted", "application_resubmitted"}
+            for event_type in discrepancy_context["audit_event_types"]
+        )
+        audit_verification = self._database.verify_audit_chain()
+        audit_integrity_explanation = (
+            "; ".join(audit_verification.errors)
+            if not audit_verification.valid
+            else "No application_submitted or application_resubmitted audit event "
+            "is associated with this application."
+            if not required_audit_events_present
+            else None
+        )
+        consistency_score = calculate_consistency_score(
+            corrected_fields=corrected_fields,
+            ocr_confidence=confidence_values,
+            field_warnings=tuple(
+                warning for warning in field_warnings if isinstance(warning, Mapping)
+            ),
+            discrepancy_warnings=discrepancy_warnings,
+            reference_available=not any(
+                warning.get("code") == "reference_comparison_unavailable"
+                for warning in discrepancy_warnings
+            ),
+            audit_check_available=True,
+            audit_integrity_passed=(
+                audit_verification.valid and required_audit_events_present
+            ),
+            audit_integrity_explanation=audit_integrity_explanation,
+        )
         ocr_status = extracted_fields.get("status", "unavailable")
         ocr_warnings = extracted_fields.get("warnings", ())
         if not isinstance(ocr_warnings, (list, tuple)):
@@ -841,6 +1030,17 @@ class AuthService:
         validation_warnings = (
             validate_corrected_fields(corrected_fields) if corrected_fields else ()
         )
+        geometry_source = extracted_fields.get("parcel_geojson")
+        extracted_values = extracted_fields.get("fields")
+        if geometry_source is None and isinstance(extracted_values, Mapping):
+            geometry_source = extracted_values.get("parcel_geojson")
+        if geometry_source is None:
+            geometry_source = corrected_fields.get("parcel_geojson")
+        geometry_status = extracted_fields.get("parcel_geometry_validation_status")
+        if geometry_status is None and isinstance(extracted_values, Mapping):
+            geometry_status = extracted_values.get("parcel_geometry_validation_status")
+        if geometry_status is None:
+            geometry_status = corrected_fields.get("parcel_geometry_validation_status")
         
         return ApplicationReviewDetail(
             id=application.id,
@@ -857,6 +1057,12 @@ class AuthService:
             ocr_status=ocr_status if isinstance(ocr_status, str) else "unavailable",
             ocr_warnings=ocr_warnings,
             validation_warnings=validation_warnings,
+            discrepancy_warnings=discrepancy_warnings,
+            consistency_score=consistency_score,
+            parcel_geojson=geometry_source,
+            parcel_geometry_validation_status=(
+                geometry_status if isinstance(geometry_status, str) else None
+            ),
             documents=tuple(
                 OfficerReviewDocument(
                     id=doc.id,
@@ -953,22 +1159,207 @@ class AuthService:
         search: str | None = None,
         district: str | None = None,
         village: str | None = None,
+        limit: int = 25,
+        offset: int = 0,
     ) -> tuple[ApprovedRegistryRecord, ...]:
-        """Return approved registry records with optional filters."""
-        principal = self.require_role(token, "officer")
-        results = self._database.list_approved_registry(search, district, village)
+        """Search the shared published registry for authenticated portal users."""
+        self.require_role(token, "officer", "landowner")
+        results = self._database.list_approved_registry(
+            search,
+            district,
+            village,
+            limit=limit,
+            offset=offset,
+        )
         return tuple(
             ApprovedRegistryRecord(
-                public_record_id=r["record"].public_record_id,
-                application_number=r["application"].application_number,
-                applicant_name=r["applicant"].full_name,
-                approved_at=r["record"].approved_at,
-                current_version=r["record"].current_version,
-                approved_fields_json=r["record"].approved_fields_json,
-                district=None,  # Would require joining with ApplicationVersion
-                village=None,
+                public_record_id=record.public_record_id,
+                approved_at=record.approved_at,
+                current_version=record.current_version,
+                district=record.district,
+                village=record.village,
+                survey_or_plot_number=record.survey_or_plot_number,
+                land_area=record.land_area,
             )
-            for r in results
+            for record in results
+        )
+
+    def get_approved_registry_record(
+        self, token: str | None, public_record_id: str
+    ) -> ApprovedRegistryDetail | None:
+        self.require_role(token, "officer", "landowner")
+        result = self._database.get_approved_registry_record(public_record_id)
+        if result is None:
+            return None
+        record_data, history_data = result
+        record = _approved_registry_record(record_data)
+        history = tuple(
+            ApprovedRegistryHistoryEvent(
+                event_type=event.event_type,
+                created_at=_utc_datetime(event.created_at),
+            )
+            for event in history_data
+        )
+        return ApprovedRegistryDetail(
+            record=record,
+            history=history,
+            audit_verified=bool(history_data)
+            and all(event.integrity_verified for event in history_data),
+        )
+
+    def list_approved_record_versions(
+        self, token: str | None, public_record_id: str
+    ) -> tuple[ApprovedRecordVersion, ...]:
+        principal = self.require_role(token, "officer", "landowner")
+        results: tuple[ApprovedRecordVersionData, ...] = (
+            self._database.list_approved_record_versions(public_record_id)
+        )
+        public_fields = {
+            "district",
+            "village",
+            "survey_or_plot_number",
+            "land_area",
+        }
+        return tuple(
+            ApprovedRecordVersion(
+                version_number=version.version_number,
+                approved_fields=(
+                    dict(version.approved_fields_json)
+                    if principal.role == "officer"
+                    else {
+                        name: value
+                        for name, value in version.approved_fields_json.items()
+                        if name in public_fields
+                    }
+                ),
+                version_hash=version.version_hash,
+                authorized_by=version.authorized_by,
+                authorizer_name=version.authorizer_name,
+                authorized_at=_utc_datetime(version.authorized_at),
+                audit_event_id=version.audit_event_id,
+                audit_event_type=version.audit_event_type,
+            )
+            for version in results
+        )
+
+    def get_public_approved_record(
+        self, public_record_id: str
+    ) -> PublicApprovedRecord | None:
+        result = self._database.get_public_approved_record(public_record_id)
+        if result is None:
+            return None
+        record, version_data = result
+        public_fields = {
+            "district",
+            "village",
+            "survey_or_plot_number",
+            "land_area",
+        }
+
+        def published(fields: Mapping[str, object]) -> dict[str, object]:
+            return {
+                name: value
+                for name, value in fields.items()
+                if name in public_fields
+            }
+
+        versions = tuple(
+            PublicRecordVersion(
+                version_number=version.version_number,
+                approved_fields=published(version.approved_fields_json),
+                version_hash=version.version_hash,
+                authorized_at=_utc_datetime(version.authorized_at),
+            )
+            for version in version_data
+        )
+        current = next(
+            (version for version in versions if version.version_number == record.current_version),
+            None,
+        )
+        if current is None:
+            return None
+        return PublicApprovedRecord(
+            public_record_id=record.public_record_id,
+            current_version=record.current_version,
+            current_version_hash=record.current_version_hash,
+            approved_fields=current.approved_fields,
+            versions=versions,
+            parcel_geojson=record.parcel_geojson,
+            parcel_geometry_validation_status=record.parcel_geometry_validation_status,
+        )
+
+    def get_public_approved_record_qr(
+        self, public_record_id: str
+    ) -> PublicRecordQRData | None:
+        """Return a public-only QR code only when this ID resolves to an approved record."""
+        record = self.get_public_approved_record(public_record_id)
+        if record is None:
+            return None
+        qr: PublicRecordQRCode = generate_public_record_qr(record.public_record_id)
+        return PublicRecordQRData(
+            public_record_id=record.public_record_id,
+            verification_url=qr.verification_url,
+            png_bytes=qr.png_bytes,
+        )
+
+    def verify_public_record_audit_integrity(
+        self, public_record_id: str
+    ) -> PublicAuditIntegrityResult | None:
+        if self._database.get_public_approved_record(public_record_id) is None:
+            return None
+        chain = self._database.verify_audit_chain()
+        version_errors = self._database.verify_approved_record_versions(public_record_id)
+        errors = (*chain.errors, *version_errors)
+        return PublicAuditIntegrityResult(
+            passed=chain.valid and not version_errors,
+            audit_chain_passed=chain.valid,
+            record_versions_passed=not version_errors,
+            event_count=chain.event_count,
+            errors=errors,
+        )
+
+    def correct_approved_record(
+        self,
+        token: str | None,
+        public_record_id: str,
+        field_changes: Mapping[str, object],
+        correction_reason: str,
+    ) -> ApprovedRecordVersionChange:
+        principal = self.require_role(token, "officer")
+        try:
+            result: ApprovedRecordVersionChangeData = (
+                self._database.create_approved_record_version(
+                    officer_id=principal.user_id,
+                    public_record_id=public_record_id,
+                    field_changes=field_changes,
+                    correction_reason=correction_reason,
+                )
+            )
+        except PermissionError as error:
+            raise AuthorizationError(str(error)) from error
+        return ApprovedRecordVersionChange(
+            public_record_id=result.public_record_id,
+            version_number=result.version_number,
+            version_hash=result.version_hash,
+            authorized_at=_utc_datetime(result.authorized_at),
+            audit_event_id=result.audit_event_id,
+        )
+
+    def get_officer_registry_internal_details(
+        self, token: str | None, public_record_id: str
+    ) -> OfficerRegistryInternalDetails | None:
+        self.require_role(token, "officer")
+        details: OfficerRegistryInternalDetailsData | None = (
+            self._database.get_officer_registry_internal_details(public_record_id)
+        )
+        if details is None:
+            return None
+        return OfficerRegistryInternalDetails(
+            application_number=details.application_number,
+            applicant_name=details.applicant_name,
+            approved_fields_json=details.approved_fields_json,
+            approver_name=details.approver_name,
+            review_notes=details.review_notes,
         )
 
     def list_audit_events(
@@ -979,8 +1370,9 @@ class AuthService:
         limit: int = 100,
     ) -> tuple[AuditEventSummary, ...]:
         """Return audit events for the audit explorer."""
-        principal = self.require_role(token, "officer")
+        self.require_role(token, "officer")
         results = self._database.list_audit_events(application_id, land_record_id, limit)
+        chain = self._database.verify_audit_chain()
         return tuple(
             AuditEventSummary(
                 id=r["event"].id,
@@ -991,28 +1383,25 @@ class AuthService:
                 land_record_id=r["event"].land_record_id,
                 event_hash=r["event"].event_hash,
                 previous_event_hash=r["event"].previous_event_hash,
-                integrity_verified=self._verify_event_hash(r["event"]),
-                created_at=r["event"].created_at,
+                integrity_verified=(
+                    chain.valid and r["event"].id in chain.verified_event_ids
+                ),
+                created_at=_utc_datetime(r["event"].created_at),
             )
             for r in results
         )
 
-    def _verify_event_hash(self, event) -> bool:
-        """Verify the SHA-256 hash chain integrity for an audit event."""
-        from modules.database import _audit_event_hash
-
-        if event.created_at is None:
-            return False
-        computed_hash = _audit_event_hash(
-            event_type=event.event_type,
-            actor_id=event.actor_id,
-            application_id=event.application_id,
-            land_record_id=event.land_record_id,
-            event_data_json=event.event_data_json,
-            previous_event_hash=event.previous_event_hash,
-            created_at=event.created_at,
+    def verify_audit_chain(self, token: str | None) -> AuditChainVerification:
+        """Verify the complete audit chain for an authorized officer."""
+        self.require_role(token, "officer")
+        result: AuditVerificationResult = self._database.verify_audit_chain()
+        return AuditChainVerification(
+            valid=result.valid,
+            event_count=result.event_count,
+            genesis_hash=GENESIS_HASH,
+            head_hash=result.head_hash,
+            errors=result.errors,
         )
-        return computed_hash == event.event_hash
 
 
 def seed_demo_accounts(

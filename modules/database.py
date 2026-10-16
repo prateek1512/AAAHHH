@@ -3,15 +3,13 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
-import json
 import os
 import sqlite3
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Iterator, Sequence
+from typing import Iterator, Mapping, Sequence
 from uuid import uuid4
 
 from sqlalchemy import (
@@ -27,14 +25,37 @@ from sqlalchemy import (
     UniqueConstraint,
     create_engine,
     event,
+    exists,
     func,
+    insert,
     select,
     update,
 )
 from sqlalchemy.engine import Engine, make_url
-from sqlalchemy.orm import DeclarativeBase, Mapped, Session, joinedload, mapped_column, relationship, sessionmaker
+from sqlalchemy.orm import (
+    DeclarativeBase,
+    Mapped,
+    Session,
+    aliased,
+    joinedload,
+    mapped_column,
+    relationship,
+    sessionmaker,
+)
 
-from modules.field_validation import validate_corrected_fields
+from modules.audit import (
+    AuditVerificationResult,
+    CanonicalJSON,
+    GENESIS_HASH,
+    append_audit_event,
+    calculate_approved_record_version_hash,
+    verify_audit_chain as verify_audit_event_chain,
+)
+from modules.field_validation import (
+    FIELD_LABELS,
+    snapshot_field_warnings,
+    validate_corrected_fields,
+)
 
 DEFAULT_DATABASE_URL = "sqlite:///./data/land_records.db"
 DATABASE_URL_ENV = "LAND_RECORDS_DATABASE_URL"
@@ -269,6 +290,73 @@ class LandRecord(Base):
         foreign_keys="AuditEvent.land_record_id",
         passive_deletes="all",
     )
+    versions: Mapped[list[ApprovedRecordVersion]] = relationship(
+        back_populates="land_record",
+        order_by="ApprovedRecordVersion.version_number",
+        passive_deletes="all",
+    )
+
+
+class ApprovedRecordVersion(Base):
+    __tablename__ = "approved_record_versions"
+    __table_args__ = (
+        UniqueConstraint(
+            "land_record_id",
+            "version_number",
+            name="uq_approved_record_version_number",
+        ),
+        UniqueConstraint("audit_event_id", name="uq_approved_record_version_audit_event"),
+        CheckConstraint("version_number >= 1", name="ck_approved_record_version_number"),
+        CheckConstraint("length(version_hash) = 64", name="ck_approved_record_version_hash"),
+        Index("ix_approved_record_versions_record_version", "land_record_id", "version_number"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    land_record_id: Mapped[int] = mapped_column(
+        ForeignKey("land_records.id", ondelete="RESTRICT"), nullable=False
+    )
+    version_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    approved_fields_json: Mapped[dict[str, object]] = mapped_column(
+        CanonicalJSON(), nullable=False
+    )
+    version_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    authorized_by: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    authorized_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    audit_event_id: Mapped[int] = mapped_column(
+        ForeignKey("audit_events.id", ondelete="RESTRICT"), nullable=False
+    )
+
+    land_record: Mapped[LandRecord] = relationship(back_populates="versions")
+    authorizer: Mapped[User] = relationship(foreign_keys=[authorized_by])
+    audit_event: Mapped[AuditEvent] = relationship(foreign_keys=[audit_event_id])
+
+
+@event.listens_for(ApprovedRecordVersion, "before_update")
+def _reject_approved_version_update(
+    mapper: object, connection: object, target: ApprovedRecordVersion
+) -> None:
+    raise ValueError(
+        f"Approved record version {target.id} is immutable and cannot be edited."
+    )
+
+
+@event.listens_for(ApprovedRecordVersion, "before_delete")
+def _reject_approved_version_delete(
+    mapper: object, connection: object, target: ApprovedRecordVersion
+) -> None:
+    raise ValueError(
+        f"Approved record version {target.id} is immutable and cannot be deleted."
+    )
+
+
+@event.listens_for(LandRecord, "before_update")
+def _reject_land_record_update(
+    mapper: object, connection: object, target: LandRecord
+) -> None:
+    raise ValueError(
+        f"Approved record {target.public_record_id} can only be changed through "
+        "the authorized correction workflow."
+    )
 
 
 class Notification(Base):
@@ -294,7 +382,7 @@ class AuditEvent(Base):
     __table_args__ = (
         CheckConstraint("length(event_hash) = 64", name="ck_audit_events_hash_length"),
         CheckConstraint(
-            "previous_event_hash IS NULL OR length(previous_event_hash) = 64",
+            "length(previous_event_hash) = 64",
             name="ck_audit_events_previous_hash_length",
         ),
         Index("ix_audit_events_application_created_at", "application_id", "created_at"),
@@ -311,8 +399,12 @@ class AuditEvent(Base):
     land_record_id: Mapped[int | None] = mapped_column(
         ForeignKey("land_records.id", ondelete="RESTRICT")
     )
-    event_data_json: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False, default=dict)
-    previous_event_hash: Mapped[str | None] = mapped_column(String(64))
+    event_data_json: Mapped[dict[str, object]] = mapped_column(
+        CanonicalJSON(), nullable=False, default=dict
+    )
+    previous_event_hash: Mapped[str] = mapped_column(
+        String(64), nullable=False, default=GENESIS_HASH
+    )
     event_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
@@ -328,6 +420,27 @@ class AuditEvent(Base):
         back_populates="audit_events",
         foreign_keys=[land_record_id],
     )
+
+
+class AuditChainState(Base):
+    __tablename__ = "audit_chain_state"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    head_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+
+
+@event.listens_for(AuditEvent, "before_update")
+def _reject_audit_event_update(
+    mapper: object, connection: object, target: AuditEvent
+) -> None:
+    raise ValueError(f"Audit event {target.id} is append-only and cannot be edited.")
+
+
+@event.listens_for(AuditEvent, "before_delete")
+def _reject_audit_event_delete(
+    mapper: object, connection: object, target: AuditEvent
+) -> None:
+    raise ValueError(f"Audit event {target.id} is append-only and cannot be deleted.")
 
 
 class AuthSession(Base):
@@ -457,6 +570,57 @@ class LandRecordSummaryData:
 
 
 @dataclass(frozen=True, slots=True)
+class ApprovedRegistryRecordData:
+    public_record_id: str
+    approved_at: datetime
+    current_version: int
+    current_version_hash: str
+    district: str | None
+    village: str | None
+    survey_or_plot_number: str | None
+    land_area: str | None
+    parcel_geojson: object | None = None
+    parcel_geometry_validation_status: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovedRegistryHistoryData:
+    event_type: str
+    created_at: datetime
+    integrity_verified: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovedRecordVersionData:
+    version_number: int
+    approved_fields_json: dict[str, object]
+    version_hash: str
+    authorized_by: int
+    authorizer_name: str
+    authorized_at: datetime
+    audit_event_id: int
+    audit_event_type: str
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovedRecordVersionChangeData:
+    public_record_id: str
+    version_number: int
+    version_hash: str
+    authorized_at: datetime
+    audit_event_id: int
+
+
+@dataclass(frozen=True, slots=True)
+class OfficerRegistryInternalDetailsData:
+    application_number: str
+    applicant_name: str
+    approved_fields_json: dict[str, object]
+    approver_name: str
+    review_notes: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class DocumentData:
     id: int
     application_id: int
@@ -496,6 +660,37 @@ def _document_data(document: Document) -> DocumentData:
     )
 
 
+def _case_insensitive_pattern(value: str) -> str:
+    escaped = value.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+def _approved_registry_record_data(record: LandRecord) -> ApprovedRegistryRecordData:
+    fields = record.approved_fields_json
+
+    def published_value(key: str) -> str | None:
+        value = fields.get(key)
+        return value.strip() if isinstance(value, str) and value.strip() else None
+
+    return ApprovedRegistryRecordData(
+        public_record_id=record.public_record_id,
+        approved_at=record.approved_at,
+        current_version=record.current_version,
+        current_version_hash=record.current_record_hash,
+        district=published_value("district"),
+        village=published_value("village"),
+        survey_or_plot_number=published_value("survey_or_plot_number"),
+        land_area=published_value("land_area"),
+        parcel_geojson=fields.get("parcel_geojson"),
+        parcel_geometry_validation_status=(
+            fields.get("parcel_geometry_validation_status")
+            if fields.get("parcel_geometry_validation_status")
+            in {"valid", "verified", "warning", "needs_review", "invalid", "unknown"}
+            else None
+        ),
+    )
+
+
 def _canonical_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
@@ -505,50 +700,6 @@ def _canonical_utc(value: datetime) -> datetime:
 def _optional_json_string(data: dict[str, object], key: str) -> str | None:
     value = data.get(key)
     return value if isinstance(value, str) else None
-
-
-def _audit_event_hash(
-    *,
-    event_type: str,
-    actor_id: int,
-    application_id: int | None,
-    land_record_id: int | None,
-    event_data_json: dict[str, object],
-    previous_event_hash: str | None,
-    created_at: datetime,
-) -> str:
-    event_data = {
-        "event_type": event_type,
-        "actor_id": actor_id,
-        "application_id": application_id,
-        "land_record_id": land_record_id,
-        "event_data_json": event_data_json,
-        "previous_event_hash": previous_event_hash,
-        "created_at": _canonical_utc(created_at).isoformat(),
-    }
-    payload = json.dumps(event_data, sort_keys=True, default=str)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-def _land_record_hash(
-    *,
-    public_record_id: str,
-    application_id: int,
-    current_version: int,
-    approved_fields_json: dict[str, object],
-    approved_by: int,
-    approved_at: datetime,
-) -> str:
-    record_data = {
-        "public_record_id": public_record_id,
-        "application_id": application_id,
-        "current_version": current_version,
-        "approved_fields_json": approved_fields_json,
-        "approved_by": approved_by,
-        "approved_at": _canonical_utc(approved_at).isoformat(),
-    }
-    payload = json.dumps(record_data, sort_keys=True, default=str)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -720,6 +871,102 @@ class Database:
                 ),
             )
 
+    def get_application_discrepancy_context(
+        self, application_id: int
+    ) -> dict[str, object]:
+        """Load only comparison fields needed by deterministic discrepancy rules."""
+        with self._session_factory() as session:
+            application = session.get(Application, application_id)
+            if application is None:
+                return {
+                    "extracted_fields": {},
+                    "previous_fields": None,
+                    "other_applications": (),
+                    "approved_records": (),
+                }
+            current = session.scalar(
+                select(ApplicationVersion).where(
+                    ApplicationVersion.application_id == application_id,
+                    ApplicationVersion.version_number == application.current_version,
+                )
+            )
+            previous = (
+                session.scalar(
+                    select(ApplicationVersion).where(
+                        ApplicationVersion.application_id == application_id,
+                        ApplicationVersion.version_number == application.current_version - 1,
+                    )
+                )
+                if application.current_version > 1
+                else None
+            )
+            active_applications = session.execute(
+                select(
+                    Application.application_number,
+                    Application.status,
+                    ApplicationVersion.corrected_fields_json,
+                )
+                .join(
+                    ApplicationVersion,
+                    (ApplicationVersion.application_id == Application.id)
+                    & (ApplicationVersion.version_number == Application.current_version),
+                )
+                .where(
+                    Application.id != application_id,
+                    Application.status.in_(
+                        ("submitted", "under_review", "corrections_requested")
+                    ),
+                )
+            ).all()
+            approved_records = session.scalars(
+                select(LandRecord).where(
+                    LandRecord.application_id != application_id,
+                    LandRecord.is_public.is_(True),
+                )
+            ).all()
+            audit_event_types = tuple(
+                session.scalars(
+                    select(AuditEvent.event_type).where(
+                        AuditEvent.application_id == application_id
+                    )
+                ).all()
+            )
+
+            extracted_json = current.extracted_fields_json if current else {}
+            extracted_fields = extracted_json.get("fields", {})
+            return {
+                "extracted_fields": (
+                    dict(extracted_fields) if isinstance(extracted_fields, dict) else {}
+                ),
+                "previous_fields": (
+                    dict(previous.corrected_fields_json) if previous is not None else None
+                ),
+                "other_applications": tuple(
+                    {
+                        "application_number": application_number,
+                        "status": status,
+                        "fields": dict(corrected_fields),
+                    }
+                    for application_number, status, corrected_fields in active_applications
+                ),
+                "approved_records": tuple(
+                    {
+                        "public_record_id": record.public_record_id,
+                        "fields": {
+                            field_name: record.approved_fields_json.get(field_name)
+                            for field_name in (
+                                "district",
+                                "village",
+                                "survey_or_plot_number",
+                                "land_area",
+                            )
+                        },
+                    }
+                    for record in approved_records
+                ),
+                "audit_event_types": audit_event_types,
+            }
+
     def create_landowner_application_document(
         self,
         *,
@@ -780,13 +1027,19 @@ class Database:
                 version = ApplicationVersion(
                     application=application,
                     version_number=application.current_version,
-                    extracted_fields_json=ocr_result_json,
+                    extracted_fields_json=snapshot_field_warnings(
+                        ocr_result_json,
+                        {},
+                    ),
                     corrected_fields_json={},
                     created_by=user_id,
                 )
                 session.add(version)
             else:
-                version.extracted_fields_json = ocr_result_json
+                version.extracted_fields_json = snapshot_field_warnings(
+                    ocr_result_json,
+                    version.corrected_fields_json,
+                )
             session.flush()
             return _document_data(document)
 
@@ -824,8 +1077,9 @@ class Database:
                 and current_version.corrected_fields_json == corrected_fields_json
             ):
                 return _document_data(document)
-            extracted_fields_json = (
-                current_version.extracted_fields_json if current_version is not None else {}
+            extracted_fields_json = snapshot_field_warnings(
+                current_version.extracted_fields_json if current_version is not None else {},
+                corrected_fields_json,
             )
             version = ApplicationVersion(
                 application=application,
@@ -936,35 +1190,17 @@ class Database:
                     "This application has already been submitted or is no longer a draft."
                 )
 
-            previous_event = session.scalar(
-                select(AuditEvent)
-                .order_by(AuditEvent.id.desc())
-                .limit(1)
-            )
-            previous_event_hash = previous_event.event_hash if previous_event else None
-            audit_data: dict[str, object] = {
-                "application_number": application.application_number,
-                "version_number": version_number,
-            }
-            event_hash = _audit_event_hash(
+            append_audit_event(
+                session,
                 event_type="application_submitted",
                 actor_id=user_id,
                 application_id=application.id,
                 land_record_id=None,
-                event_data_json=audit_data,
-                previous_event_hash=previous_event_hash,
+                event_data={
+                    "application_number": application.application_number,
+                    "version_number": version_number,
+                },
                 created_at=submitted_at,
-            )
-            session.add(
-                AuditEvent(
-                    event_type="application_submitted",
-                    actor_id=user_id,
-                    application_id=application.id,
-                    event_data_json=audit_data,
-                    previous_event_hash=previous_event_hash,
-                    event_hash=event_hash,
-                    created_at=submitted_at,
-                )
             )
             session.add(
                 Notification(
@@ -1038,7 +1274,10 @@ class Database:
                     ApplicationVersion(
                         application_id=application.id,
                         version_number=source_version_number,
-                        extracted_fields_json=dict(current_version.extracted_fields_json),
+                        extracted_fields_json=snapshot_field_warnings(
+                            current_version.extracted_fields_json,
+                            revised_fields,
+                        ),
                         corrected_fields_json=revised_fields,
                         created_at=submitted_at,
                         created_by=user_id,
@@ -1048,7 +1287,10 @@ class Database:
             snapshot = ApplicationVersion(
                 application_id=application.id,
                 version_number=version_number,
-                extracted_fields_json=dict(current_version.extracted_fields_json),
+                extracted_fields_json=snapshot_field_warnings(
+                    current_version.extracted_fields_json,
+                    revised_fields,
+                ),
                 corrected_fields_json=revised_fields,
                 created_at=submitted_at,
                 created_by=user_id,
@@ -1075,37 +1317,17 @@ class Database:
                     "This application was already resubmitted or has changed. Refresh and try again."
                 )
 
-            previous_event = session.scalar(
-                select(AuditEvent)
-                .order_by(AuditEvent.id.desc())
-                .limit(1)
-                .with_for_update()
-            )
-            previous_event_hash = previous_event.event_hash if previous_event else None
-            audit_data: dict[str, object] = {
-                "application_number": application.application_number,
-                "version_number": version_number,
-            }
-            event_type = "application_resubmitted"
-            event_hash = _audit_event_hash(
-                event_type=event_type,
+            append_audit_event(
+                session,
+                event_type="application_resubmitted",
                 actor_id=user_id,
                 application_id=application.id,
                 land_record_id=None,
-                event_data_json=audit_data,
-                previous_event_hash=previous_event_hash,
+                event_data={
+                    "application_number": application.application_number,
+                    "version_number": version_number,
+                },
                 created_at=submitted_at,
-            )
-            session.add(
-                AuditEvent(
-                    event_type=event_type,
-                    actor_id=user_id,
-                    application_id=application.id,
-                    event_data_json=audit_data,
-                    previous_event_hash=previous_event_hash,
-                    event_hash=event_hash,
-                    created_at=submitted_at,
-                )
             )
             session.add(
                 Notification(
@@ -1597,35 +1819,18 @@ class Database:
                     "The application changed before review could begin. Refresh and try again."
                 )
 
-            previous_event = session.scalar(
-                select(AuditEvent).order_by(AuditEvent.id.desc()).limit(1)
-            )
-            previous_event_hash = previous_event.event_hash if previous_event else None
-            audit_data: dict[str, object] = {
-                "application_number": application.application_number,
-                "previous_status": previous_status,
-                "status": review_status,
-            }
-            event_type = "application_review_started"
-            event_hash = _audit_event_hash(
-                event_type=event_type,
+            append_audit_event(
+                session,
+                event_type="application_review_started",
                 actor_id=officer_id,
                 application_id=application.id,
                 land_record_id=None,
-                event_data_json=audit_data,
-                previous_event_hash=previous_event_hash,
+                event_data={
+                    "application_number": application.application_number,
+                    "previous_status": previous_status,
+                    "status": review_status,
+                },
                 created_at=now,
-            )
-            session.add(
-                AuditEvent(
-                    event_type=event_type,
-                    actor_id=officer_id,
-                    application_id=application.id,
-                    event_data_json=audit_data,
-                    previous_event_hash=previous_event_hash,
-                    event_hash=event_hash,
-                    created_at=now,
-                )
             )
             session.flush()
             return OfficerReviewStartedData(
@@ -1716,26 +1921,28 @@ class Database:
 
             public_record_id: str | None = None
             land_record: LandRecord | None = None
+            approved_fields: dict[str, object] | None = None
+            approved_version_hash: str | None = None
             if decision == "approve":
                 public_record_id = f"LR-REC-{decided_at:%Y}-{uuid4().hex[:8].upper()}"
                 approved_fields = dict(version.corrected_fields_json)
-                record_hash = _land_record_hash(
+                approved_version_hash = calculate_approved_record_version_hash(
                     public_record_id=public_record_id,
                     application_id=application_id,
-                    current_version=version.version_number,
-                    approved_fields_json=approved_fields,
-                    approved_by=officer_id,
-                    approved_at=decided_at,
+                    version_number=1,
+                    approved_fields=approved_fields,
+                    authorized_by=officer_id,
+                    authorized_at=decided_at,
                 )
                 land_record = LandRecord(
                     application_id=application_id,
                     public_record_id=public_record_id,
-                    current_version=version.version_number,
+                    current_version=1,
                     approved_fields_json=approved_fields,
-                    current_record_hash=record_hash,
+                    current_record_hash=approved_version_hash,
                     approved_at=decided_at,
                     approved_by=officer_id,
-                    is_public=False,
+                    is_public=True,
                 )
                 session.add(land_record)
                 session.flush()
@@ -1749,43 +1956,56 @@ class Database:
             )
             session.add(review_event)
 
-            previous_event = session.scalar(
-                select(AuditEvent)
-                .order_by(AuditEvent.id.desc())
-                .limit(1)
-                .with_for_update()
-            )
-            previous_event_hash = previous_event.event_hash if previous_event else None
             audit_data: dict[str, object] = {
                 "application_number": application.application_number,
                 "decision": decision,
                 "previous_status": "under_review",
                 "status": new_status,
-                "comments": clean_comments or None,
                 "public_record_id": public_record_id,
                 "version_number": version.version_number,
             }
-            event_hash = _audit_event_hash(
-                event_type=f"application_{decision}",
+            if land_record is not None:
+                audit_data["approved_record_hash"] = approved_version_hash
+                audit_data["approved_version_number"] = 1
+            append_audit_event(
+                session,
+                event_type=(
+                    "application_request_corrections"
+                    if decision == "request_corrections"
+                    else f"application_{decision}"
+                ),
                 actor_id=officer_id,
                 application_id=application_id,
                 land_record_id=land_record.id if land_record else None,
-                event_data_json=audit_data,
-                previous_event_hash=previous_event_hash,
+                event_data=audit_data,
                 created_at=decided_at,
             )
-            session.add(
-                AuditEvent(
-                    event_type=f"application_{decision}",
+
+            if land_record is not None:
+                version_event = append_audit_event(
+                    session,
+                    event_type="approved_record_version_created",
                     actor_id=officer_id,
                     application_id=application_id,
-                    land_record_id=land_record.id if land_record else None,
-                    event_data_json=audit_data,
-                    previous_event_hash=previous_event_hash,
-                    event_hash=event_hash,
+                    land_record_id=land_record.id,
+                    event_data={
+                        "public_record_id": land_record.public_record_id,
+                        "version_number": 1,
+                        "approved_record_hash": approved_version_hash,
+                    },
                     created_at=decided_at,
                 )
-            )
+                session.add(
+                    ApprovedRecordVersion(
+                        land_record_id=land_record.id,
+                        version_number=1,
+                        approved_fields_json=approved_fields or {},
+                        version_hash=approved_version_hash or "",
+                        authorized_by=officer_id,
+                        authorized_at=decided_at,
+                        audit_event_id=version_event.id,
+                    )
+                )
 
             if decision == "approve":
                 title = "Application approved"
@@ -1829,36 +2049,440 @@ class Database:
         search: str | None = None,
         district: str | None = None,
         village: str | None = None,
-    ) -> tuple[dict, ...]:
-        """Return approved land records with optional filters."""
+        limit: int = 25,
+        offset: int = 0,
+    ) -> tuple[ApprovedRegistryRecordData, ...]:
+        """Return published snapshots approved through the officer workflow."""
+        limit = min(max(limit, 1), 50)
+        offset = max(offset, 0)
         with self._session_factory() as session:
-            query = (
-                select(LandRecord, Application, User)
-                .join(Application, LandRecord.application_id == Application.id)
-                .join(User, Application.applicant_id == User.id)
-                .where(Application.status == "approved")
-            )
-            
-            if search:
-                query = query.where(
-                    LandRecord.public_record_id.ilike(f"%{search}%") |
-                    Application.application_number.ilike(f"%{search}%")
+            approved_by_officer = exists(
+                select(AuditEvent.id)
+                .join(User, AuditEvent.actor_id == User.id)
+                .where(
+                    AuditEvent.land_record_id == LandRecord.id,
+                    AuditEvent.application_id == Application.id,
+                    AuditEvent.event_type == "application_approve",
+                    User.role == "officer",
                 )
-            # District/village filters would require joining with ApplicationVersion
-            # For now, we return the basic records
-            
-            results = session.execute(
-                query.order_by(LandRecord.approved_at.desc(), LandRecord.id.desc())
-            ).all()
-            
-            return tuple(
-                {
-                    "record": record,
-                    "application": application,
-                    "applicant": applicant,
-                }
-                for record, application, applicant in results
             )
+            query = (
+                select(LandRecord)
+                .join(Application, LandRecord.application_id == Application.id)
+                .where(
+                    Application.status == "approved",
+                    LandRecord.is_public.is_(True),
+                    approved_by_officer,
+                )
+            )
+
+            if search and search.strip():
+                search_pattern = _case_insensitive_pattern(search)
+                query = query.where(
+                    LandRecord.public_record_id.ilike(search_pattern, escape="\\")
+                    | LandRecord.approved_fields_json["survey_or_plot_number"]
+                    .as_string()
+                    .ilike(search_pattern, escape="\\")
+                )
+
+            for field_name, value in (("district", district), ("village", village)):
+                if value and value.strip():
+                    query = query.where(
+                        LandRecord.approved_fields_json[field_name]
+                        .as_string()
+                        .ilike(_case_insensitive_pattern(value), escape="\\")
+                    )
+
+            records = session.scalars(
+                query.order_by(LandRecord.approved_at.desc(), LandRecord.id.desc())
+                .offset(offset)
+                .limit(limit)
+            )
+            return tuple(
+                _approved_registry_record_data(record)
+                for record in records
+            )
+
+    def get_approved_registry_record(
+        self, public_record_id: str
+    ) -> tuple[ApprovedRegistryRecordData, tuple[ApprovedRegistryHistoryData, ...]] | None:
+        with self._session_factory() as session:
+            approved_by_officer = exists(
+                select(AuditEvent.id)
+                .join(User, AuditEvent.actor_id == User.id)
+                .where(
+                    AuditEvent.land_record_id == LandRecord.id,
+                    AuditEvent.application_id == Application.id,
+                    AuditEvent.event_type == "application_approve",
+                    User.role == "officer",
+                )
+            )
+            record = session.scalar(
+                select(LandRecord)
+                .join(Application, LandRecord.application_id == Application.id)
+                .where(
+                    LandRecord.public_record_id == public_record_id,
+                    LandRecord.is_public.is_(True),
+                    Application.status == "approved",
+                    approved_by_officer,
+                )
+            )
+            if record is None:
+                return None
+
+            events = session.scalars(
+                select(AuditEvent)
+                .where(
+                    (AuditEvent.land_record_id == record.id)
+                    | (AuditEvent.application_id == record.application_id)
+                )
+                .order_by(AuditEvent.created_at, AuditEvent.id)
+            )
+            chain_result = _verify_audit_chain_in_session(session)
+            history = tuple(
+                ApprovedRegistryHistoryData(
+                    event_type=audit_event.event_type,
+                    created_at=audit_event.created_at,
+                    integrity_verified=chain_result.valid,
+                )
+                for audit_event in events
+            )
+            return _approved_registry_record_data(record), history
+
+    def list_approved_record_versions(
+        self, public_record_id: str
+    ) -> tuple[ApprovedRecordVersionData, ...]:
+        with self._session_factory() as session:
+            rows = session.execute(
+                select(ApprovedRecordVersion, User, AuditEvent)
+                .join(LandRecord, ApprovedRecordVersion.land_record_id == LandRecord.id)
+                .join(Application, LandRecord.application_id == Application.id)
+                .join(User, ApprovedRecordVersion.authorized_by == User.id)
+                .join(AuditEvent, ApprovedRecordVersion.audit_event_id == AuditEvent.id)
+                .where(
+                    LandRecord.public_record_id == public_record_id,
+                    LandRecord.is_public.is_(True),
+                    Application.status == "approved",
+                )
+                .order_by(ApprovedRecordVersion.version_number)
+            ).all()
+            return tuple(
+                ApprovedRecordVersionData(
+                    version_number=version.version_number,
+                    approved_fields_json=dict(version.approved_fields_json),
+                    version_hash=version.version_hash,
+                    authorized_by=version.authorized_by,
+                    authorizer_name=authorizer.full_name,
+                    authorized_at=version.authorized_at,
+                    audit_event_id=audit_event.id,
+                    audit_event_type=audit_event.event_type,
+                )
+                for version, authorizer, audit_event in rows
+            )
+
+    def get_public_approved_record(
+        self, public_record_id: str
+    ) -> tuple[ApprovedRegistryRecordData, tuple[ApprovedRecordVersionData, ...]] | None:
+        with self._session_factory() as session:
+            authorized_approval = exists(
+                select(AuditEvent.id)
+                .join(User, AuditEvent.actor_id == User.id)
+                .where(
+                    AuditEvent.land_record_id == LandRecord.id,
+                    AuditEvent.application_id == Application.id,
+                    AuditEvent.event_type == "application_approve",
+                    User.role == "officer",
+                )
+            )
+            record = session.scalar(
+                select(LandRecord)
+                .join(Application, LandRecord.application_id == Application.id)
+                .where(
+                    LandRecord.public_record_id == public_record_id,
+                    LandRecord.is_public.is_(True),
+                    Application.status == "approved",
+                    authorized_approval,
+                )
+            )
+            if record is None:
+                return None
+            rows = session.execute(
+                select(ApprovedRecordVersion, User, AuditEvent)
+                .join(User, ApprovedRecordVersion.authorized_by == User.id)
+                .join(AuditEvent, ApprovedRecordVersion.audit_event_id == AuditEvent.id)
+                .where(ApprovedRecordVersion.land_record_id == record.id)
+                .order_by(ApprovedRecordVersion.version_number)
+            ).all()
+            versions = tuple(
+                ApprovedRecordVersionData(
+                    version_number=version.version_number,
+                    approved_fields_json=dict(version.approved_fields_json),
+                    version_hash=version.version_hash,
+                    authorized_by=version.authorized_by,
+                    authorizer_name=authorizer.full_name,
+                    authorized_at=version.authorized_at,
+                    audit_event_id=audit_event.id,
+                    audit_event_type=audit_event.event_type,
+                )
+                for version, authorizer, audit_event in rows
+            )
+            return _approved_registry_record_data(record), versions
+
+    def verify_approved_record_versions(self, public_record_id: str) -> tuple[str, ...]:
+        with self._session_factory() as session:
+            record = session.scalar(
+                select(LandRecord)
+                .join(Application, LandRecord.application_id == Application.id)
+                .where(
+                    LandRecord.public_record_id == public_record_id,
+                    LandRecord.is_public.is_(True),
+                    Application.status == "approved",
+                )
+            )
+            if record is None:
+                return ("Approved record is unavailable.",)
+            versions = session.scalars(
+                select(ApprovedRecordVersion)
+                .where(ApprovedRecordVersion.land_record_id == record.id)
+                .order_by(ApprovedRecordVersion.version_number)
+            ).all()
+            errors: list[str] = []
+            expected_number = 1
+            for version in versions:
+                if version.version_number != expected_number:
+                    errors.append(
+                        f"Approved record version gap before version {version.version_number}."
+                    )
+                expected_number = version.version_number + 1
+                expected_hash = calculate_approved_record_version_hash(
+                    public_record_id=record.public_record_id,
+                    application_id=record.application_id,
+                    version_number=version.version_number,
+                    approved_fields=version.approved_fields_json,
+                    authorized_by=version.authorized_by,
+                    authorized_at=version.authorized_at,
+                )
+                if version.version_hash != expected_hash:
+                    errors.append(
+                        f"Approved record version {version.version_number} hash mismatch."
+                    )
+                event = session.get(AuditEvent, version.audit_event_id)
+                if event is None:
+                    errors.append(
+                        f"Approved record version {version.version_number} audit event is missing."
+                    )
+                elif (
+                    event.event_type != "approved_record_version_created"
+                    or event.land_record_id != record.id
+                    or event.application_id != record.application_id
+                    or event.actor_id != version.authorized_by
+                    or event.event_data_json.get("version_number") != version.version_number
+                    or event.event_data_json.get("approved_record_hash") != version.version_hash
+                ):
+                    errors.append(
+                        f"Approved record version {version.version_number} does not match "
+                        "its linked audit event."
+                    )
+            if not versions:
+                errors.append("No approved record version snapshots exist.")
+            elif (
+                versions[-1].version_number != record.current_version
+                or versions[-1].version_hash != record.current_record_hash
+                or versions[-1].approved_fields_json != record.approved_fields_json
+                or versions[-1].authorized_by != record.approved_by
+                or versions[-1].authorized_at != record.approved_at
+            ):
+                errors.append("Current approved record does not match its latest version.")
+            return tuple(errors)
+
+    def create_approved_record_version(
+        self,
+        *,
+        officer_id: int,
+        public_record_id: str,
+        field_changes: Mapping[str, object],
+        correction_reason: str,
+    ) -> ApprovedRecordVersionChangeData:
+        reason = correction_reason.strip()
+        if len(reason) < 10:
+            raise ValueError("Provide a meaningful correction reason of at least 10 characters.")
+        if not field_changes:
+            raise ValueError("Provide at least one field to correct.")
+        unknown_fields = set(field_changes) - FIELD_LABELS.keys()
+        if unknown_fields:
+            raise ValueError("The correction contains unsupported approved-record fields.")
+
+        with transaction(self._session_factory) as session:
+            record = session.scalar(
+                select(LandRecord)
+                .join(Application, LandRecord.application_id == Application.id)
+                .where(
+                    LandRecord.public_record_id == public_record_id,
+                    LandRecord.is_public.is_(True),
+                    Application.status == "approved",
+                )
+                .with_for_update()
+            )
+            if record is None:
+                raise PermissionError("This approved record is not available for correction.")
+
+            latest_version = session.scalar(
+                select(ApprovedRecordVersion)
+                .where(ApprovedRecordVersion.land_record_id == record.id)
+                .order_by(ApprovedRecordVersion.version_number.desc())
+                .limit(1)
+            )
+            if (
+                latest_version is None
+                or latest_version.version_number != record.current_version
+                or latest_version.version_hash != record.current_record_hash
+                or latest_version.approved_fields_json != record.approved_fields_json
+            ):
+                raise ValueError(
+                    "The current approved record does not match its latest immutable version."
+                )
+
+            new_fields = dict(latest_version.approved_fields_json)
+            new_fields.update(field_changes)
+            validation_errors = validate_corrected_fields(new_fields)
+            if validation_errors:
+                raise ValueError(
+                    "The corrected approved record is invalid: "
+                    + " ".join(validation_errors)
+                )
+            changed_fields = sorted(
+                field_name
+                for field_name in set(latest_version.approved_fields_json) | set(new_fields)
+                if latest_version.approved_fields_json.get(field_name) != new_fields.get(field_name)
+            )
+            if not changed_fields:
+                raise ValueError("The correction does not change any approved fields.")
+
+            authorized_at = utc_now()
+            version_number = latest_version.version_number + 1
+            version_hash = calculate_approved_record_version_hash(
+                public_record_id=record.public_record_id,
+                application_id=record.application_id,
+                version_number=version_number,
+                approved_fields=new_fields,
+                authorized_by=officer_id,
+                authorized_at=authorized_at,
+            )
+            correction_event = append_audit_event(
+                session,
+                event_type="approved_record_correction_authorized",
+                actor_id=officer_id,
+                application_id=record.application_id,
+                land_record_id=record.id,
+                event_data={
+                    "public_record_id": record.public_record_id,
+                    "previous_version": latest_version.version_number,
+                    "version_number": version_number,
+                    "previous_approved_record_hash": latest_version.version_hash,
+                    "approved_record_hash": version_hash,
+                    "changed_fields": changed_fields,
+                    "correction_reason": reason,
+                },
+                created_at=authorized_at,
+            )
+            version_event = append_audit_event(
+                session,
+                event_type="approved_record_version_created",
+                actor_id=officer_id,
+                application_id=record.application_id,
+                land_record_id=record.id,
+                event_data={
+                    "public_record_id": record.public_record_id,
+                    "version_number": version_number,
+                    "approved_record_hash": version_hash,
+                    "authorization_event_id": correction_event.id,
+                },
+                created_at=authorized_at,
+            )
+            session.add(
+                ApprovedRecordVersion(
+                    land_record_id=record.id,
+                    version_number=version_number,
+                    approved_fields_json=new_fields,
+                    version_hash=version_hash,
+                    authorized_by=officer_id,
+                    authorized_at=authorized_at,
+                    audit_event_id=version_event.id,
+                )
+            )
+            session.flush()
+            session.connection().execute(
+                update(LandRecord)
+                .where(
+                    LandRecord.id == record.id,
+                    LandRecord.current_version == latest_version.version_number,
+                )
+                .values(
+                    current_version=version_number,
+                    approved_fields_json=new_fields,
+                    current_record_hash=version_hash,
+                    approved_at=authorized_at,
+                    approved_by=officer_id,
+                )
+            )
+            return ApprovedRecordVersionChangeData(
+                public_record_id=record.public_record_id,
+                version_number=version_number,
+                version_hash=version_hash,
+                authorized_at=authorized_at,
+                audit_event_id=version_event.id,
+            )
+
+    def get_officer_registry_internal_details(
+        self, public_record_id: str
+    ) -> OfficerRegistryInternalDetailsData | None:
+        applicant_user = aliased(User)
+        approver_user = aliased(User)
+        audit_actor = aliased(User)
+        with self._session_factory() as session:
+            result = session.execute(
+                select(LandRecord, Application, applicant_user, approver_user)
+                .join(Application, LandRecord.application_id == Application.id)
+                .join(applicant_user, Application.applicant_id == applicant_user.id)
+                .join(approver_user, LandRecord.approved_by == approver_user.id)
+                .where(
+                    LandRecord.public_record_id == public_record_id,
+                    LandRecord.is_public.is_(True),
+                    Application.status == "approved",
+                    exists(
+                        select(AuditEvent.id)
+                        .join(audit_actor, AuditEvent.actor_id == audit_actor.id)
+                        .where(
+                            AuditEvent.land_record_id == LandRecord.id,
+                            AuditEvent.application_id == Application.id,
+                            AuditEvent.event_type == "application_approve",
+                            audit_actor.role == "officer",
+                        )
+                    ),
+                )
+            ).first()
+            if result is None:
+                return None
+            record, application, applicant, approver = result
+            notes = session.scalars(
+                select(ReviewEvent.comments)
+                .where(
+                    ReviewEvent.application_id == application.id,
+                    ReviewEvent.comments.is_not(None),
+                )
+                .order_by(ReviewEvent.created_at, ReviewEvent.id)
+            )
+            return OfficerRegistryInternalDetailsData(
+                application_number=application.application_number,
+                applicant_name=applicant.full_name,
+                approved_fields_json=dict(record.approved_fields_json),
+                approver_name=approver.full_name,
+                review_notes=tuple(note for note in notes if note),
+            )
+
+    def verify_audit_chain(self) -> AuditVerificationResult:
+        with self._session_factory() as session:
+            return _verify_audit_chain_in_session(session)
 
     def list_audit_events(
         self,
@@ -1963,13 +2587,119 @@ def transaction(session_factory: sessionmaker[Session]) -> Iterator[Session]:
             yield session
 
 
+def _verify_audit_chain_in_session(session: Session) -> AuditVerificationResult:
+    result = verify_audit_event_chain(session.scalars(select(AuditEvent)).all())
+    state = session.get(AuditChainState, 1)
+    if state is None:
+        if result.event_count == 0:
+            return result
+        message = "Audit chain head state is missing."
+    elif state.head_hash != (result.head_hash or GENESIS_HASH):
+        message = "Stored audit chain head does not match the verified event chain."
+    else:
+        return result
+    return replace(
+        result,
+        valid=False,
+        errors=(*result.errors, message),
+    )
+
+
 def initialize_database(database_url: str | None = None) -> None:
     """Create all database tables."""
     engine = create_database_engine(database_url)
     try:
         Base.metadata.create_all(engine)
+        with engine.begin() as connection:
+            dialect_name = connection.dialect.name
+            if dialect_name == "sqlite":
+                from sqlalchemy.dialects.sqlite import insert as dialect_insert
+
+                statement = dialect_insert(AuditChainState).values(
+                    id=1, head_hash=GENESIS_HASH
+                )
+                connection.execute(
+                    statement.on_conflict_do_nothing(index_elements=["id"])
+                )
+            elif dialect_name == "postgresql":
+                from sqlalchemy.dialects.postgresql import insert as dialect_insert
+
+                statement = dialect_insert(AuditChainState).values(
+                    id=1, head_hash=GENESIS_HASH
+                )
+                connection.execute(
+                    statement.on_conflict_do_nothing(index_elements=["id"])
+                )
+            elif connection.execute(
+                select(AuditChainState.id).where(AuditChainState.id == 1)
+            ).scalar_one_or_none() is None:
+                connection.execute(
+                    insert(AuditChainState).values(id=1, head_hash=GENESIS_HASH)
+                )
+        _backfill_initial_approved_record_versions(engine)
     finally:
         engine.dispose()
+
+
+def _backfill_initial_approved_record_versions(engine: Engine) -> None:
+    factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    with transaction(factory) as session:
+        records = session.scalars(
+            select(LandRecord)
+            .join(Application, LandRecord.application_id == Application.id)
+            .where(
+                Application.status == "approved",
+                ~exists(
+                    select(ApprovedRecordVersion.id).where(
+                        ApprovedRecordVersion.land_record_id == LandRecord.id
+                    )
+                ),
+            )
+            .order_by(LandRecord.id)
+        ).all()
+        for record in records:
+            approval_event = session.scalar(
+                select(AuditEvent)
+                .where(
+                    AuditEvent.application_id == record.application_id,
+                    AuditEvent.land_record_id == record.id,
+                    AuditEvent.event_type == "application_approve",
+                )
+                .order_by(AuditEvent.id)
+                .limit(1)
+            )
+            if approval_event is None:
+                raise RuntimeError(
+                    f"Approved record {record.public_record_id} has no approval audit "
+                    "event; its initial version cannot be migrated safely."
+                )
+            version_hash = calculate_approved_record_version_hash(
+                public_record_id=record.public_record_id,
+                application_id=record.application_id,
+                version_number=1,
+                approved_fields=record.approved_fields_json,
+                authorized_by=record.approved_by,
+                authorized_at=record.approved_at,
+            )
+            session.add(
+                ApprovedRecordVersion(
+                    land_record_id=record.id,
+                    version_number=1,
+                    approved_fields_json=dict(record.approved_fields_json),
+                    version_hash=version_hash,
+                    authorized_by=record.approved_by,
+                    authorized_at=record.approved_at,
+                    audit_event_id=approval_event.id,
+                )
+            )
+            session.connection().execute(
+                update(LandRecord)
+                .where(LandRecord.id == record.id)
+                .values(
+                    current_version=1,
+                    current_record_hash=version_hash,
+                )
+            )
 
 
 def main() -> None:

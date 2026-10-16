@@ -209,6 +209,11 @@ def test_correction_resubmission_preserves_versions_and_notifies_reviewers(
     initial_submission = service.submit_landowner_application(owner_token, application_id)
 
     service.start_officer_application_review(officer_token, application_id)
+    review_detail = service.get_application_for_review(officer_token, application_id)
+    assert review_detail is not None
+    assert review_detail.status == "under_review"
+    assert review_detail.corrected_fields_json["owner_name"] == "Synthetic Owner"
+    assert review_detail.extracted_fields_json["fields"]["owner_name"] == "OCR Owner"
     service.decide_officer_application(
         officer_token,
         application_id,
@@ -218,6 +223,18 @@ def test_correction_resubmission_preserves_versions_and_notifies_reviewers(
 
     correction_detail = service.get_landowner_application(owner_token, application_id)
     assert correction_detail.status == "corrections_requested"
+    with session_factory() as session:
+        owner = session.scalar(select(User).where(User.email == "owner@example.test"))
+        assert owner is not None
+        correction_notification = session.scalar(
+            select(Notification).where(
+                Notification.application_id == application_id,
+                Notification.user_id == owner.id,
+                Notification.title == "Corrections requested",
+            )
+        )
+        assert correction_notification is not None
+        assert "correct the survey number" in correction_notification.message.lower()
     correction_event = correction_detail.review_events[-1]
     assert correction_event.decision == "request_corrections"
     assert "correct the survey number" in (correction_event.comments or "")
@@ -331,6 +348,44 @@ def test_correction_resubmission_preserves_versions_and_notifies_reviewers(
     assert approved_detail.status == "approved"
     assert approved_detail.public_record_id == approval.public_record_id
     assert approved_detail.review_events[-1].decision == "approve"
+    assert approval.public_record_id is not None
+    registry = service.list_approved_registry(owner_token)
+    assert len(registry) == 1
+    assert registry[0].public_record_id == approval.public_record_id
+    assert registry[0].current_version == 1
+    public_record = service.get_public_approved_record(approval.public_record_id)
+    assert public_record is not None
+    assert public_record.current_version == 1
+    assert len(public_record.current_version_hash) == 64
+    assert public_record.approved_fields == {
+        "district": "Sample District",
+        "village": "Sample Village",
+        "survey_or_plot_number": "SY-456",
+        "land_area": "2.5 acres",
+    }
+    assert len(public_record.versions) == 1
+    assert public_record.versions[0].version_number == 1
+    verification = service.verify_public_record_audit_integrity(
+        approval.public_record_id
+    )
+    assert verification is not None
+    assert verification.passed is True
+    assert service.verify_audit_chain(officer_token).valid is True
+    qr = service.get_public_approved_record_qr(approval.public_record_id)
+    assert qr is not None
+    assert approval.public_record_id in qr.verification_url
+    assert "application_id" not in qr.verification_url
+    with session_factory() as session:
+        owner = session.scalar(select(User).where(User.email == "owner@example.test"))
+        assert owner is not None
+        approval_notification = session.scalar(
+            select(Notification).where(
+                Notification.application_id == application_id,
+                Notification.user_id == owner.id,
+                Notification.title == "Application approved",
+            )
+        )
+        assert approval_notification is not None
     with pytest.raises(AuthorizationError, match="already been approved"):
         service.save_landowner_document_corrections(
             owner_token,

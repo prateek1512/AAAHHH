@@ -14,8 +14,14 @@ from modules.auth import (
 )
 from modules.auth_ui import get_auth_service, render_login
 from modules.document_storage import DocumentStorageError
-from modules.field_validation import FIELD_LABELS, REQUIRED_FIELDS, validate_corrected_fields
+from modules.field_validation import (
+    FIELD_LABELS,
+    REQUIRED_FIELDS,
+    build_field_warnings,
+    validate_corrected_fields,
+)
 from modules.ocr import render_document_preview
+from modules.registry_ui import render_approved_registry
 
 st.set_page_config(
     page_title="Landowner Portal",
@@ -67,7 +73,7 @@ PAGES = (
     "Upload Land Document",
     "My Applications",
     "Notifications",
-    "Approved Land Records",
+    "Approved Registry",
 )
 
 with st.sidebar:
@@ -181,6 +187,33 @@ def _show_pending_notice() -> None:
     )
 
 
+def _render_discrepancy_warnings(
+    warnings: tuple[dict[str, object], ...],
+    *,
+    title: str,
+) -> None:
+    if not warnings:
+        st.info("No warnings from the available discrepancy checks.")
+        return
+    with st.expander(f"{title} ({len(warnings)})", expanded=False):
+        for warning in warnings:
+            severity = warning.get("severity")
+            label = (
+                "Format or required-field issue"
+                if severity == "definite"
+                else "Possible discrepancy"
+                if severity == "possible"
+                else "Comparison unavailable"
+            )
+            fields = warning.get("fields_compared", [])
+            st.markdown(f"**{label} · {', '.join(fields)}**")
+            st.write(warning.get("rule", ""))
+            values = warning.get("compared_values", {})
+            if isinstance(values, dict):
+                for field_name, value in values.items():
+                    st.caption(f"{field_name}: {value}")
+
+
 def _dashboard() -> None:
     st.markdown('<div class="portal-eyebrow">Overview</div>', unsafe_allow_html=True)
     st.title("Your land record dashboard")
@@ -285,10 +318,12 @@ def _upload_document() -> None:
                 st.caption("Preview is unavailable; the original document remains stored privately.")
 
             ocr_result = document.ocr_result
+            confidence: dict[str, object] = {}
+            field_warnings: list[dict[str, object]] = []
             if not ocr_result:
                 st.warning("OCR output is not available. You can still enter fields manually.")
                 extracted_fields: dict[str, object] = {}
-                confidence: dict[str, object] = {}
+                field_warnings = build_field_warnings({}, document.corrected_fields_json)
             else:
                 status = str(ocr_result.get("status", "unavailable"))
                 st.write(f"OCR processing status: **{status.capitalize()}**")
@@ -319,6 +354,18 @@ def _upload_document() -> None:
                         if isinstance(raw_confidence, dict)
                         else {}
                     )
+                    raw_field_warnings = ocr_result.get("field_warnings")
+                    if isinstance(raw_field_warnings, list):
+                        field_warnings = [
+                            warning
+                            for warning in raw_field_warnings
+                            if isinstance(warning, dict)
+                        ]
+                    else:
+                        field_warnings = build_field_warnings(
+                            ocr_result,
+                            document.corrected_fields_json,
+                        )
                     if isinstance(extracted_fields, dict):
                         for field_name, value in extracted_fields.items():
                             field_confidence = (
@@ -328,7 +375,7 @@ def _upload_document() -> None:
                             )
                             if value:
                                 confidence_text = (
-                                    f" · OCR token confidence {field_confidence}%"
+                                    f" · OCR engine confidence {field_confidence}%"
                                     if isinstance(field_confidence, (int, float))
                                     else ""
                                 )
@@ -337,6 +384,18 @@ def _upload_document() -> None:
                     if isinstance(warnings, list):
                         for warning in warnings:
                             st.warning(f"OCR warning: {warning}")
+                    if field_warnings:
+                        with st.expander(
+                            f"Field review notes ({len(field_warnings)})",
+                            expanded=False,
+                        ):
+                            for warning in field_warnings:
+                                field_name = warning.get("field")
+                                label = FIELD_LABELS.get(
+                                    field_name,
+                                    str(field_name).replace("_", " ").title(),
+                                )
+                                st.warning(f"{label}: {warning.get('message', '')}")
 
             corrected_fields = document.corrected_fields_json
             field_labels = (
@@ -386,28 +445,11 @@ def _upload_document() -> None:
                         if isinstance(existing_correction, str)
                         else ocr_value if isinstance(ocr_value, str) else ""
                     )
-                    field_confidence = confidence.get(field_name)
-                    source_missing = not isinstance(ocr_value, str) or not ocr_value.strip()
-                    low_confidence = (
-                        isinstance(field_confidence, (int, float))
-                        and field_confidence < 60
-                    )
-                    if source_missing:
-                        required_note = (
-                            " This field is required before you can save."
-                            if field_name in REQUIRED_FIELDS
-                            else ""
-                        )
-                        st.warning(
-                            f"{label}: OCR did not find a labeled value. Enter it from the "
-                            f"original document.{required_note}"
-                        )
-                    elif low_confidence:
-                        st.warning(
-                            f"{label}: OCR text confidence is low "
-                            f"({field_confidence}%). Check the value against the original; "
-                            "this score does not measure legal correctness."
-                        )
+                    relevant_warnings = [
+                        warning
+                        for warning in field_warnings
+                        if warning.get("field") == field_name
+                    ]
                     source_text = (
                         "Owner-entered/reviewed value"
                         if isinstance(existing_correction, str) and existing_correction
@@ -415,6 +457,13 @@ def _upload_document() -> None:
                         else "Owner-entered value"
                     )
                     st.caption(f"{label} source: {source_text}")
+                    if relevant_warnings:
+                        st.caption(f"Review note: {relevant_warnings[0].get('message', '')}")
+                        if len(relevant_warnings) > 1:
+                            st.caption(
+                                f"{len(relevant_warnings) - 1} additional note(s) are shown "
+                                "in OCR results."
+                            )
                     help_text = (
                         "Enter a positive number and one explicit unit, for example "
                         "'2.5 acres' or '120 sq ft'. Units are not converted."
@@ -493,6 +542,26 @@ def _upload_document() -> None:
             elif saved_field_errors:
                 st.caption("Complete and save all required fields before submitting.")
 
+            try:
+                application_detail = service.get_landowner_application(
+                    token,
+                    document.application_id,
+                )
+            except AuthorizationError as error:
+                st.error(str(error))
+                continue
+            except SQLAlchemyError:
+                logger.exception(
+                    "Database error checking application discrepancies for %s",
+                    document.application_id,
+                )
+                st.error("Discrepancy checks are currently unavailable.")
+                continue
+            _render_discrepancy_warnings(
+                application_detail.discrepancy_warnings,
+                title="Submission checks",
+            )
+
             if st.button(
                 "Submit application for verification",
                 type="primary",
@@ -569,6 +638,11 @@ def _my_applications() -> None:
     for field_name, value in detail.corrected_fields_json.items():
         label = field_name.replace("_", " ").title()
         st.write(f"**{label}:** {value if isinstance(value, str) and value else 'Not provided'}")
+    if detail.discrepancy_warnings:
+        _render_discrepancy_warnings(
+            detail.discrepancy_warnings,
+            title="Field checks and comparisons",
+        )
     if detail.status in ("submitted", "under_review"):
         _show_pending_notice()
 
@@ -763,26 +837,7 @@ def _notifications() -> None:
 
 
 def _approved_records() -> None:
-    st.markdown('<div class="portal-eyebrow">Verified records</div>', unsafe_allow_html=True)
-    st.title("Approved Land Records")
-    st.caption(
-        "Only record references and approval dates are shown here. Private documents, "
-        "personal field data, and officer notes are not displayed."
-    )
-    records = service.list_landowner_approved_records(token)
-    if not records:
-        st.info("You don't have any approved land records yet.")
-        return
-
-    for record in records:
-        with st.container(border=True):
-            record_column, date_column = st.columns([2, 1])
-            with record_column:
-                st.markdown(f"**{record.public_record_id}**")
-                st.caption(f"Approved version {record.current_version}")
-            with date_column:
-                st.caption("Approved")
-                st.write(record.approved_at.strftime("%d %b %Y"))
+    render_approved_registry(service, token, "landowner")
 
 
 if current_page == "Dashboard":
@@ -793,5 +848,5 @@ elif current_page == "My Applications":
     _my_applications()
 elif current_page == "Notifications":
     _notifications()
-elif current_page == "Approved Land Records":
+elif current_page == "Approved Registry":
     _approved_records()
